@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsConfig,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
     ModelOptQuantConfigBase,
@@ -205,6 +206,11 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             # Weight-only compressed-tensors checkpoints (e.g. AWQ/GPTQ W4A16
             # Flash-Next) quantize Linear layers only; the PLE n-gram table
             # ships unquantized.
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if (
+            isinstance(quant_config, INCConfig)
+            and not quant_config.config_parser.resolve(None, prefix).quantized
+        ):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
             raise NotImplementedError(
