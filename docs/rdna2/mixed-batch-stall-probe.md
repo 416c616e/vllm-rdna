@@ -316,7 +316,7 @@ With one bucket of samples the cap can also drop below its initial 512 tokens.
 
 ### Where it is on
 
-**Dense 27B (`27b-awq`, `27b-exl3`, `full`): on, budget 250 ms.** 16k injection
+**Dense 27B at TP=4 (`27b-awq`, `27b-exl3`): on, budget 250 ms.** Off in `full` (27B at TP=2): steps are ~2x slower there, and the cap cut 16k/1k c=8 aggregate output 22.7 -> 19.6 tok/s (TTFT 135 -> 200 s). 16k injection
 into 6 decoders, TP=4 F&P:
 
 | Metric | off | cap 250 ms |
