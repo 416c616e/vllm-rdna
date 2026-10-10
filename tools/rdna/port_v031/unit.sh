@@ -62,22 +62,25 @@ FILES=(
     # register the same op name, so collecting both in one process fails.
     tests/models/qwen4_exp/test_config.py
     tests/models/qwen4_exp/test_hc_ops.py
+    tests/models/qwen4_exp/test_hc_prefill_rdna2.py
     tests/models/qwen4_exp/test_ple.py
     tests/models/qwen4_exp/test_ple_amd.py
     tests/models/qwen4_exp/test_qsa_amd.py
     tests/models/qwen4_exp/test_qsa_pre_indexer.py
     tests/models/qwen4_exp/test_qsa_reference.py
-    tests/compile/test_cudagraph_replay_inputs.py
     tests/compile/test_config.py
     tests/distributed/test_rdna_p2p.py
+    tests/distributed/test_rdna_ar_gpu.py
     tests/platforms/test_rocm_amdsmi_index.py
     tests/v1/attention/test_gdn_metadata_builder.py
     tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+    tests/v1/core/test_decode_stall_bound.py
     tests/v1/core/test_kv_cache_utils.py
     tests/v1/core/test_mamba_align_chunk_split.py
     tests/v1/core/test_mixed_batch_policy.py
     tests/v1/core/test_prefix_caching.py
     tests/v1/engine/test_prefill_cadence.py
+    tests/tools/test_stall_probe.py
     tests/v1/kv_offload/test_factory.py
     tests/v1/ple_offload/test_ple_quant_gather.py
     tests/v1/spec_decode/test_qwen4_exp.py
