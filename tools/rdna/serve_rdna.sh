@@ -143,6 +143,22 @@ COMPILATION_CONFIG=${COMPILATION_CONFIG:-}
 EAGER=${EAGER:-0}
 ALLOC_CONF=${ALLOC_CONF:-}
 TUNED_CONFIG=${TUNED_CONFIG:-0}
+# PLE n-gram table (Qwen4Exp / Flash-Next): bf16 = upstream pinned BF16 table
+# (~95 GB host RAM); int4 = INT4 table from PLE_QUANT_DIR in pinned RAM (~30 GB);
+# int4-disk = same INT4 table memory-mapped from disk, served by the CPU sidecar
+# (page cache only). PLE_QUANT_DIR is a ples_int4 directory from
+# primitive-ai/Qwen3.8-Flash-Next-PLE-quant.
+PLE_QUANT_DIR=${PLE_QUANT_DIR:-${VLLM_PLE_QUANT_DIR:-}}
+if [[ -z ${PLE:-} ]]; then
+    # Default follows the raw env vars when set the old way.
+    if [[ -n $PLE_QUANT_DIR && ${VLLM_PLE_CPU_OFFLOAD:-0} == 1 ]]; then
+        PLE=int4-disk
+    elif [[ -n $PLE_QUANT_DIR ]]; then
+        PLE=int4
+    else
+        PLE=bf16
+    fi
+fi
 ATTN=${ATTN:-fa}
 FEATURES=${FEATURES:-}
 REQUIRED_VARS=${REQUIRED_VARS:-}
@@ -165,6 +181,25 @@ if ((rdse_print)); then
     RDNA_DRY_RUN=1
 fi
 rdna_init
+
+case $PLE in
+    bf16)
+        unset VLLM_PLE_QUANT_DIR VLLM_PLE_CPU_OFFLOAD
+        PLE_QUANT_DIR=
+        ;;
+    int4 | int4-disk)
+        [[ -n $PLE_QUANT_DIR ]] || rdna_die "PLE=$PLE needs PLE_QUANT_DIR=/path/to/ples_int4."
+        [[ -f $PLE_QUANT_DIR/META.json ]] || rdna_die "PLE_QUANT_DIR=$PLE_QUANT_DIR has no META.json."
+        export VLLM_PLE_QUANT_DIR=$PLE_QUANT_DIR
+        if [[ $PLE == int4-disk ]]; then
+            export VLLM_PLE_CPU_OFFLOAD=1
+            export VLLM_PLE_OFFLOAD_READY_TIMEOUT=${VLLM_PLE_OFFLOAD_READY_TIMEOUT:-3600}
+        else
+            unset VLLM_PLE_CPU_OFFLOAD
+        fi
+        ;;
+    *) rdna_die "PLE must be bf16, int4 or int4-disk (got '$PLE')." ;;
+esac
 
 if [[ $TUNED_CONFIG == 1 ]]; then
     export VLLM_TUNED_CONFIG_FOLDER=${VLLM_TUNED_CONFIG_FOLDER:-$source_dir/tuned-moe}
@@ -344,6 +379,7 @@ rdse_print_plan() {
     printf '# recipe:    %s (%s)\n' "$rdse_recipe" "$recipe_file"
     printf '# tunableop: %s\n' "$rdse_profile_line"
     printf '# entry:     %s\n' "$SERVE_ENTRY"
+    printf '# ple:       %s%s\n' "$PLE" "${PLE_QUANT_DIR:+ ($PLE_QUANT_DIR)}"
     printf '\n# --- environment ---\n'
     for _key in "${RDSE_ENV_KEYS[@]}"; do
         if [[ -v $_key ]]; then
