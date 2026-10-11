@@ -140,23 +140,30 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
     assert draft_config.n_predict == 1
 
 
-@pytest.mark.parametrize("ple_layer_ids", [[1], []])
-def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
-    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
-    rest of the architecture is PP-capable, so the refusal must be conditional
-    -- and must land before the engine spends time loading weights."""
-    vllm_config = SimpleNamespace(
+def _pp_vllm_config(ple_layer_ids, pipeline_parallel_size=2):
+    return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
             multimodal_config=None,
         ),
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=2, enable_dbo=False, ubatch_size=1
+            pipeline_parallel_size=pipeline_parallel_size,
+            enable_dbo=False,
+            ubatch_size=1,
         ),
         speculative_config=None,
     )
-    with patch.object(
-        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+
+
+@pytest.mark.parametrize("ple_layer_ids", [[1], []])
+def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
+    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
+    rest of the architecture is PP-capable, so the refusal must be conditional
+    -- and must land before the engine spends time loading weights."""
+    vllm_config = _pp_vllm_config(ple_layer_ids)
+    with (
+        patch.object(Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"),
+        patch("vllm.platforms.rdna.on_rdna_family", return_value=False),
     ):
         if ple_layer_ids:
             with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
@@ -165,6 +172,27 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
                 )
         else:
             Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(("ple_layer_ids", "allowed"), [([1], True), ([2], False)])
+def test_qwen4_exp_rdna_allows_pipeline_parallel_with_ple_on_stage0(
+    ple_layer_ids, allowed, monkeypatch
+) -> None:
+    """On RDNA, PP > 1 is accepted iff every PLE layer sits on stage 0 (two
+    layers split 1/1: PLE id 1 -> layer 0 -> stage 0, id 2 -> stage 1)."""
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    vllm_config = _pp_vllm_config(ple_layer_ids)
+    with (
+        patch.object(Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"),
+        patch("vllm.platforms.rdna.on_rdna_family", return_value=True),
+    ):
+        if allowed:
+            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        else:
+            with pytest.raises(NotImplementedError, match="first pipeline stage"):
+                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
+                    vllm_config
+                )
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:

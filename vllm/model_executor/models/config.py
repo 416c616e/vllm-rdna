@@ -893,28 +893,17 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
-        # engine from loading weights first.
-        pp_size = parallel_config.pipeline_parallel_size
-        if text_config.ple_layer_ids and pp_size > 1:
-            # Only the first pipeline stage sees the raw input_ids the N-gram
-            # PLE embedding hashes, so every PLE layer must live there.
-            from vllm.distributed.utils import get_pp_indices
+        # engine from loading weights first. RDNA allows PP > 1 when every PLE
+        # layer sits on the first pipeline stage.
+        from vllm.models.qwen4_exp.common.ple_pp import (
+            rdna_ple_pp_unsupported_reason,
+        )
 
-            first_start, first_end = get_pp_indices(
-                text_config.num_hidden_layers, 0, pp_size
-            )
-            off_first = [
-                i
-                for i in text_config.ple_layer_ids
-                if not first_start <= i < first_end
-            ]
-            if off_first:
-                raise NotImplementedError(
-                    f"Qwen4Exp N-gram PLE layers {off_first} fall outside the first "
-                    f"pipeline stage (layers {first_start}-{first_end - 1}); "
-                    "non-first ranks do not receive the raw input_ids they need. "
-                    "Set VLLM_PP_LAYER_PARTITION so every PLE layer lands on stage 0."
-                )
+        reason = rdna_ple_pp_unsupported_reason(
+            text_config, parallel_config.pipeline_parallel_size
+        )
+        if reason is not None:
+            raise NotImplementedError(reason)
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)
