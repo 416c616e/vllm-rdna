@@ -15,10 +15,8 @@
 // ------
 // * Activations: the dense ``w4a8_act_quant_kernel`` (per-(token, group)
 //   scales, ``a8_lds_k32_ag`` layout) runs ONCE per call over the whole token
-//   batch, expert-agnostic. The int8 A, per-(token, group) fp32 scales and
-//   int32 group sums live in a per-(M, K, G) cached workspace so their device
-//   pointers are stable across calls (a per-call ``at::empty`` inside a
-//   captured graph is the suspected `duct` corruption source on this stack).
+//   batch, expert-agnostic, into a per-call workspace (W4A8 is prefill-only,
+//   so it never runs inside a captured graph).
 // * GEMM: grid ``(num_token_blocks, ceil(N/1024), ceil(K/256))``, 256 threads,
 //   4 N columns per thread, K_STEP = 32. Each block owns BLOCK_M sorted
 //   tokens of one expert and 256 K positions (whole weight groups).
@@ -346,37 +344,6 @@ void w4a8_moe_log_shape(int m, int k, int n, int group, int block_m) {
   fflush(stderr);
 }
 
-// Stable per-(m, k, groups, device) activation workspace. Held for the life of
-// the process so the device pointers captured into a graph never move; the
-// dense path's per-call allocation is the suspected graph-aliasing source.
-struct Workspace {
-  at::Tensor a_i8;     // [T, K/8, 8, 8] int8
-  at::Tensor a_scale;  // [T, G, 8] fp32
-  at::Tensor a_sum;    // [T, G, 8] int32
-};
-
-const Workspace& get_workspace(int64_t m, int64_t k, int64_t g,
-                               int64_t device) {
-  static std::mutex mu;
-  static std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, Workspace>
-      cache;
-  std::lock_guard<std::mutex> lock(mu);
-  const auto key = std::make_tuple(m, k, g, device);
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-  const at::Device dev(at::kCUDA, device);
-  Workspace ws;
-  ws.a_i8 = at::empty({(m + 7) / 8, k / 8, 8, 8},
-                      at::TensorOptions().device(dev).dtype(at::kChar));
-  ws.a_scale = at::empty({(m + 7) / 8, g, 8},
-                         at::TensorOptions().device(dev).dtype(at::kFloat));
-  ws.a_sum = at::empty({(m + 7) / 8, g, 8},
-                       at::TensorOptions().device(dev).dtype(at::kInt));
-  return cache.emplace(key, std::move(ws)).first->second;
-}
-
 struct MoeArgs {
   const int8_t* a_i8;
   const float* a_scale;
@@ -505,9 +472,16 @@ void moe_w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
 
   const at::cuda::OptionalCUDAGuard guard(a.device());
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  const int64_t device = a.get_device();
 
-  const Workspace& ws = get_workspace(size_m, size_k, groups, device);
+  // Per-call activation workspace through the caching allocator, as the dense
+  // W4A8 path does: a per-shape cache grows with every new token count.
+  const int64_t tiles = (size_m + mw::kMTile - 1) / mw::kMTile;
+  const auto opts = a.options();
+  struct {
+    at::Tensor a_i8, a_scale, a_sum;
+  } ws{at::empty({tiles, size_k / 8, mw::kMTile, 8}, opts.dtype(at::kChar)),
+       at::empty({tiles, groups, mw::kMTile}, opts.dtype(at::kFloat)),
+       at::empty({tiles, groups, mw::kMTile}, opts.dtype(at::kInt))};
 
   // int8 A: per-(token, group) quant in the a8_lds_k32_ag layout.
   {

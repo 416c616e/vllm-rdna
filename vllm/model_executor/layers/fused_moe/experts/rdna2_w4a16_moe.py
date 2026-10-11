@@ -41,9 +41,10 @@ logger = init_logger(__name__)
 # W4A8 (int4 weights, int8 activations) MoE opt-in. Default OFF; resolved once
 # at weight-load time so the traced forward only reads a Python bool.
 W4A8_MOE_ENV_VAR = "VLLM_RDNA2_W4A8_SDOT4"
-# W4A8 is prefill-only, like the dense path: decode batches (fewer than this
-# many tokens) keep the W4A16 kernel.
-W4A8_MOE_MIN_TOKENS = 33
+# W4A8 is prefill-only: below this many tokens the W4A16 kernel is as fast or
+# faster (V620, Flash-Next per-rank shapes, tools/rdna/bench_moe_w4a8.py:
+# 0.94x at 256, 1.00x at 512, 1.24x at 1024, 1.38x at 2048, 1.43x at 4096).
+W4A8_MOE_MIN_TOKENS = 512
 
 # moe_gptq_gemm_rdna2 supports block_size_m in {1, 2, 4, 8} (the kernel's
 # TORCH_CHECK). The pre-allocated routing buffers must be large enough for the
