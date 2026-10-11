@@ -140,7 +140,7 @@ if [[ ${WARMUP:-1} == 1 ]]; then
     wseqs=8
     for a in "$@"; do [[ $a == SEQS=* ]] && wseqs=${a#SEQS=}; done
     t_w=$(date +%s)
-    "$VENV/bin/python" "$TREE/tools/rdna/port_v031/ladder_warmup.py" --url "$URL" \
+    "$VENV/bin/python" "$TREE/tools/rdna/port_v031/ladder_warmup.py" --url "http://127.0.0.1:$PORT" \
         --model "$SERVED" --max-seqs "$wseqs" \
         ${wsizes:+--sizes "$wsizes"} > "$OUT/warmup.txt" 2>&1
     log "warmup rc=$? in $(( $(date +%s) - t_w ))s (sizes ${wsizes:-default}); slowest:"

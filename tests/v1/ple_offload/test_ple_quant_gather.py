@@ -10,16 +10,6 @@ and dequants through a 256-entry LUT in gather_rows_small.
 
 from __future__ import annotations
 
-# The imports below follow the module-level skip on purpose.
-# ruff: noqa: E402
-import pytest
-
-pytest.skip(
-    "The fork's PLE CPU sidecar is not wired on the v0.31 port; Flash-Next "
-    "uses upstream EngramConfig.cpu_offload (docs/rdna2/v0.31.0-port-notes.md).",
-    allow_module_level=True,
-)
-
 import importlib.util
 import logging
 import sys
@@ -133,7 +123,7 @@ def _load_worker(monkeypatch: pytest.MonkeyPatch):
         "vllm.model_executor.model_loader.weight_utils",
         _mod(
             "vllm.model_executor.model_loader.weight_utils",
-            initialize_dummy_weights=lambda *a, **k: None,
+            initialize_single_dummy_weight=lambda *a, **k: None,
         ),
     )
     monkeypatch.setitem(
@@ -272,3 +262,80 @@ def test_is_fp8_excludes_e2m1_even_if_layout_mentions_e4m3(
 ):
     is_fp8 = ("e4m3" in layout) and ("e2m1" not in layout)
     assert is_fp8 is expect_fp8
+
+
+class _RecordingTable:
+    """Quant-table stand-in that records the gathered ids (int4 gate)."""
+
+    layout = "int4_g16"
+    is_fp8 = False
+
+    def __init__(self) -> None:
+        self.ids: list[np.ndarray] = []
+
+    def gather_rows_small(self, ids, out) -> None:
+        self.ids.append(np.array(ids))
+        out[:] = 0.0
+
+
+def _ngram_layer(table, ngram_size=3, hpn=2, eos=7):
+    heads = (ngram_size - 1) * hpn
+    gen = torch.Generator().manual_seed(1)
+    return SimpleNamespace(
+        ngram_embedding=SimpleNamespace(_ple_quant=table),
+        ngram_size=ngram_size,
+        heads_per_ngram=hpn,
+        eos_token_id=eos,
+        layer_multipliers=torch.randint(
+            1, 2**62, (ngram_size,), generator=gen, dtype=torch.long
+        ),
+        ngram_heads_vocab_sizes=torch.tensor([101, 103, 107, 109])[:heads],
+        ngram_heads_offsets=torch.tensor([0, 101, 204, 311])[:heads],
+        head_dim=2,
+        embedding_dim=2 * heads,
+    )
+
+
+def test_fused_spec_verify_matches_single_token_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """MTP verify (k tokens per request) gathers the same ids as k decode steps."""
+    worker = _load_worker(monkeypatch)
+    num_reqs, k, n = 3, 3, 3
+    gen = torch.Generator().manual_seed(0)
+    # Small vocabulary so EOS (7) shows up inside contexts and drafts.
+    ctx = torch.randint(0, 12, (num_reqs, n - 1), generator=gen, dtype=torch.long)
+    tok = torch.randint(0, 12, (num_reqs, k), generator=gen, dtype=torch.long)
+    pinned = torch.zeros(num_reqs * k + 2, 8, dtype=torch.float16)
+
+    spec = _RecordingTable()
+    qsl = torch.arange(0, (num_reqs + 1) * k, k, dtype=torch.int32)
+    out = worker._fused_decode_lookup(
+        _ngram_layer(spec), tok.reshape(-1), qsl, ctx, pinned, False
+    )
+    assert out is not None and out.shape[0] == num_reqs * k
+    got = spec.ids[0].reshape(num_reqs, k, -1)
+
+    for j in range(k):
+        single = _RecordingTable()
+        history = torch.cat([ctx, tok[:, :j]], dim=1)[:, -(n - 1) :]
+        worker._fused_decode_lookup(
+            _ngram_layer(single),
+            tok[:, j].contiguous(),
+            torch.arange(num_reqs + 1, dtype=torch.int32),
+            history,
+            torch.zeros(num_reqs, 8, dtype=torch.float16),
+            False,
+        )
+        np.testing.assert_array_equal(got[:, j], single.ids[0].reshape(num_reqs, -1))
+
+
+def test_fused_path_rejects_non_uniform_batches(monkeypatch: pytest.MonkeyPatch):
+    worker = _load_worker(monkeypatch)
+    table = _RecordingTable()
+    ids = torch.zeros(5, dtype=torch.long)
+    qsl = torch.tensor([0, 3, 5], dtype=torch.int32)  # 3 + 2 tokens: prefill
+    ctx = torch.zeros(2, 2, dtype=torch.long)
+    pinned = torch.zeros(5, 8, dtype=torch.float16)
+    layer = _ngram_layer(table)
+    assert worker._fused_decode_lookup(layer, ids, qsl, ctx, pinned, False) is None

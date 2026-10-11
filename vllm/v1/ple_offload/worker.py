@@ -606,7 +606,20 @@ def _fused_decode_lookup(
     qsl = query_start_loc.numpy()
     num_reqs = qsl.shape[0] - 1
     num_tokens = input_ids.shape[0]
-    if num_reqs == 1:
+    # Speculative verify (MTP): every request carries the same k = 1 + num_spec
+    # tokens. Small uniform batches take the vectorized multi-token path below.
+    spec_k = 0
+    if 1 <= num_reqs <= 64 and int(qsl[1]) > 1:
+        k = int(qsl[1])
+        if k <= 8 and np.array_equal(
+            qsl, np.arange(0, (num_reqs + 1) * k, k, dtype=qsl.dtype)
+        ):
+            spec_k = k
+        else:
+            return None  # prefill / chunked batch
+    if spec_k:
+        pass
+    elif num_reqs == 1:
         if int(qsl[1]) != 1:
             return None  # one request with >1 token: prefill
     else:
@@ -626,6 +639,30 @@ def _fused_decode_lookup(
         )
         layer._ple_np_consts = consts
     ngram_size, hpn, eos, mult, sizes, offsets = consts
+    if spec_k:
+        n_rows = num_reqs * spec_k
+        ids = _uniform_ngram_ids(
+            ngram_context[:num_reqs].numpy(),
+            input_ids[:n_rows].numpy().reshape(num_reqs, spec_k),
+            consts,
+        ).reshape(-1)
+        rows = np.empty((ids.shape[0], layer.head_dim), dtype=np.float32)
+        quant.gather_rows_small(ids, rows)
+        out = pinned[:num_tokens]
+        f32 = rows.reshape(n_rows, layer.embedding_dim)
+        if out.dtype == torch.bfloat16:
+            u = f32.view(np.uint32)
+            out16 = out[:n_rows].view(torch.int16).numpy().view(np.uint16)
+            out16[:] = ((u + (((u >> 16) & 1) + np.uint32(0x7FFF))) >> 16).astype(
+                np.uint16
+            )
+        else:
+            out[:n_rows].copy_(torch.from_numpy(f32))
+        if num_tokens > n_rows:
+            out[n_rows:].zero_()
+        if check:
+            _fused_check(layer, input_ids, query_start_loc, ngram_context, out, n_rows)
+        return out
     if num_reqs == 1:
         # Single request (the common decode case): plain Python integers instead of ~15
         # tiny numpy ops (74 -> 4 us). Same int64 wraparound (mod 2**64, reinterpret
@@ -736,6 +773,42 @@ def _fused_decode_lookup(
     if check:
         _fused_check(layer, input_ids, query_start_loc, ngram_context, out, num_reqs)
     return out
+
+
+def _uniform_ngram_ids(ctx, tok, consts):
+    """N-gram ids for ``k`` new tokens per request (forward_impl's hashing).
+
+    ``ctx`` is (R, ngram_size - 1) int64, the tokens before the step; ``tok`` is
+    (R, k) int64. Returns (R, k, heads) int64. Same int64 wraparound, EOS
+    segmentation (last EOS strictly before the position) and floor modulo as
+    the single-token paths.
+    """
+    import numpy as np
+
+    ngram_size, hpn, eos, mult, sizes, offsets = consts
+    num_reqs, k = tok.shape
+    row = np.concatenate([ctx.astype(np.int64), tok.astype(np.int64)], axis=1)
+    pos = np.arange(row.shape[1])
+    prev_incl = np.maximum.accumulate(np.where(row == eos, pos, -1), axis=1)
+    prev = np.concatenate(
+        [np.full((num_reqs, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1
+    )
+    seg = (pos[None, :] - prev - 1)[:, ngram_size - 1 :]
+    a = ngram_size - 1 + np.arange(k)
+    shifted = [row[:, a]]
+    for sh in range(1, ngram_size):
+        shifted.append(np.where(seg >= sh, row[:, a - sh], eos))
+    with np.errstate(over="ignore"):
+        blocks = []
+        mixed = shifted[0] * mult[0]
+        for n in range(2, ngram_size + 1):
+            mixed = np.bitwise_xor(mixed, shifted[n - 1] * mult[n - 1])
+            start = (n - 2) * hpn
+            blocks.append(
+                np.remainder(mixed[..., None], sizes[start : start + hpn])
+                + offsets[start : start + hpn]
+            )
+    return np.concatenate(blocks, axis=-1)
 
 
 def _fused_check(
