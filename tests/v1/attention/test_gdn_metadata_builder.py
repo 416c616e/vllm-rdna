@@ -432,17 +432,25 @@ def test_cudagraph_capture_batch_stays_decode_only():
     torch.testing.assert_close(staged, common_attn_metadata.block_table_tensor[:, 0])
 
 
-def test_decode_arena_max_bs_covers_capture_size():
-    """Capture sizes [1,2,4,8] must not be clipped by max_num_seqs=4."""
-    builder = _create_gdn_builder(
-        piecewise_cuda_graph=True,
-        max_num_seqs=4,
-        max_cudagraph_capture_size=8,
-    )
-    assert builder.decode_cudagraph_max_bs == 8
-    assert builder.non_spec_state_indices_tensor.shape[0] == 8
-    assert builder.cache_slot_indices_buf.shape[0] == 8
-    assert gdn_decode_arena_max_bs(builder.vllm_config) == 8
+def test_decode_arena_max_bs_follows_decode_batch():
+    """Arenas are sized by the decode batch, not the capture ladder.
+
+    The V2 runner never captures a decode graph with more requests than
+    max_num_seqs (cudagraph_utils clamps or skips those sizes), so capture
+    sizes above max_num_seqs * (num_spec + 1) are mixed/prefill PIECEWISE
+    graphs that do not use the arenas. Sizing by the largest capture size
+    allocated 1.5 GiB per GDN layer with a 2048 prefill ladder (ad356d1135).
+    """
+    for capture in (8, 2048):
+        builder = _create_gdn_builder(
+            piecewise_cuda_graph=True,
+            max_num_seqs=4,
+            max_cudagraph_capture_size=capture,
+        )
+        assert builder.decode_cudagraph_max_bs == 4
+        assert builder.non_spec_state_indices_tensor.shape[0] == 4
+        assert builder.cache_slot_indices_buf.shape[0] == 4
+        assert gdn_decode_arena_max_bs(builder.vllm_config) == 4
 
 
 def test_piecewise_decode_copies_indices_into_static_buffers():
