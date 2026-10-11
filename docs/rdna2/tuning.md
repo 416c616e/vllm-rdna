@@ -70,7 +70,7 @@ actually sets.
 
 | Env | Default | Notes |
 |---|---|---|
-| `VLLM_RDNA2_W4A8_SDOT4` | 0 | **Opt-in.** int8-activation prefill GEMMs (M ≥ 33; decode stays W4A16). 27B AWQ: prefill +24–34 %, PPL 4.90 vs 4.94. MoE W4A8 for Flash-Next: draft PR #65. |
+| `VLLM_RDNA2_W4A8_SDOT4` | 0 | **Opt-in.** int8-activation prefill GEMMs; decode stays W4A16. Dense from M ≥ 33 (27B AWQ: prefill +24–34 %, PPL 4.90 vs 4.94); MoE from 512 tokens (Flash-Next: prefill +14–17 %, PPL 4.84 vs 4.86). `tools/rdna/bench_moe_w4a8.py` A/Bs the MoE kernel. |
 | `VLLM_RDNA2_W4A16_RUNTIME_DISPATCH` | 0 | Choose decode/prefill kernel per call at run time (custom op) instead of at trace time. |
 | `VLLM_RDNA_DENSE_INT8`, `_ONLY`, `_MIN_ROWS` | 0, 0, 64 | int8 weight-only shadow copies of dense fp16 projections for decode. Off in all recipes. |
 | `VLLM_RDNA_DENSE_GEMV` | 0 | Force `gemv_f16_rdna2` for n ≤ 5. **Never route anything to wvSplitK on gfx1030**: it asserts on device. |
