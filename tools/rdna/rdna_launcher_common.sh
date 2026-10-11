@@ -68,7 +68,7 @@ rdna_init() {
     ROCM_SDK_LIB="$VENV/lib/python3.12/site-packages/_rocm_sdk_libraries/lib"
     ROCM_SDK="$VENV/lib/python3.12/site-packages/_rocm_sdk_core/lib"
     export ROCM_SDK_ROOT ROCM_SDK_LIB ROCM_SDK
-    export LD_LIBRARY_PATH="$ROCM_SDK_LIB:$ROCM_SDK/host-math/lib:$ROCM_SDK/rocm_sysdeps/lib:$ROCM_SDK/core/lib:$VENV/lib/python3.12/site-packages/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="$ROCM_SDK_LIB:$ROCM_SDK:$ROCM_SDK/host-math/lib:$ROCM_SDK/rocm_sysdeps/lib:$ROCM_SDK/core/lib:$VENV/lib/python3.12/site-packages/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export ROCM_HOME=${ROCM_HOME:-$ROCM_SDK_ROOT} ROCM_PATH=${ROCM_PATH:-$ROCM_SDK_ROOT}
     export HIP_PATH=${HIP_PATH:-$ROCM_SDK_ROOT} HIP_ROOT_DIR=${HIP_ROOT_DIR:-$ROCM_SDK_ROOT}
     [[ -d $ROCM_SDK_ROOT/include ]] && export CPATH="$ROCM_SDK_ROOT/include${CPATH:+:$CPATH}"
