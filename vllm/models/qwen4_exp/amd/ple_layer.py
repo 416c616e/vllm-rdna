@@ -407,7 +407,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if embedding.supports_prefetch:
             output = ngram_ids.new_empty(
                 (ngram_ids.shape[0], self.embedding_dim),
-                dtype=embedding.weight.dtype,
+                dtype=embedding.lookup_dtype,
             )
             torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_pinned(
                 ngram_ids,
@@ -452,6 +452,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 loaded.add(name)
                 continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
+                method = getattr(self.ngram_embedding, "embedding_method", None)
+                if getattr(method, "lookup_dequantizes", False):
+                    # The table comes from VLLM_PLE_QUANT_DIR after loading.
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
                     regular_weights.append((name, loaded_weight))
@@ -1248,7 +1253,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if self._rdna_opaque_embedding:
             ngram = self.ple_embedding.ngram_embedding
             dtype = (
-                ngram.weight.dtype if ngram.supports_prefetch else ngram.params_dtype
+                ngram.lookup_dtype if ngram.supports_prefetch else ngram.params_dtype
             )
             embeddings = hidden_states.new_empty(
                 (input_ids.shape[0], self.ple_embedding.embedding_dim), dtype=dtype
