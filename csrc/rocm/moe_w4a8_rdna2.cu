@@ -69,7 +69,7 @@ constexpr int kNPerThread = 4;
 constexpr int kNTile = kThreads * kNPerThread;  // 1024 output columns
 constexpr int kKBlock = 256;                    // K positions per block
 constexpr int kKStep = 32;                      // K positions per inner step
-constexpr int kDW = kKStep / 8;                 // W dwords per step
+[[maybe_unused]] constexpr int kDW = kKStep / 8;  // W dwords per step
 constexpr int kMTile = 8;                // act_quant tile (matches dense)
 constexpr int kChunkBytes = kMTile * 8;  // bytes per 8-K chunk per row
 
