@@ -15,7 +15,10 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.attention import (
+    DeepseekV4Attention,
+    compressor_score_mm,
+)
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
@@ -40,6 +43,12 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_inverse_rope_rows_,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
+)
+from vllm.v1.attention.ops.rocm_rdna2_mla_sparse import (
+    is_available as _rdna2_mla_available,
+)
+from vllm.v1.attention.ops.rocm_rdna2_mla_sparse import (
+    rocm_rdna2_sparse_attn_decode,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -775,10 +784,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             return q, qr_out, qr_scale_out, kv_out
 
         def main_compressor_chain() -> None:
-            score = torch.mm(
-                hidden_states,
-                compressor.fused_wkv_wgate.weight.T,
-                out_dtype=torch.float32,
+            score = compressor_score_mm(
+                hidden_states, compressor.fused_wkv_wgate.weight
             )
             compressor(score, positions, self.rotary_emb)
 
@@ -801,10 +808,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             return
 
         def indexer_compressor_chain() -> None:
-            score = torch.mm(
-                hidden_states,
-                indexer.compressor.fused_wkv_wgate.weight.T,
-                out_dtype=torch.float32,
+            score = compressor_score_mm(
+                hidden_states, indexer.compressor.fused_wkv_wgate.weight
             )
             indexer.compressor(score, positions, self.indexer_rotary_emb)
 
@@ -1052,11 +1057,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             raise RuntimeError("Fused compressor weight requires a C4 indexer")
 
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
-        fused_scores = torch.mm(
-            hidden_states,
-            fused_weight.T,
-            out_dtype=torch.float32,
-        )
+        fused_scores = compressor_score_mm(hidden_states, fused_weight)
         kv_score, indexer_kv_score = fused_scores.split(split_sizes, dim=-1)
         indexer_weights, _ = indexer.weights_proj(hidden_states)
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
@@ -1312,7 +1313,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
 
-        return rocm_sparse_attn_decode(
+        _decode_fn = (
+            rocm_rdna2_sparse_attn_decode
+            if _rdna2_mla_available()
+            else rocm_sparse_attn_decode
+        )
+        return _decode_fn(
             q=q,
             kv_cache=kv_cache,
             swa_k_cache=self.swa_cache_layer.kv_cache,

@@ -81,6 +81,27 @@ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 logger = init_logger(__name__)
 
 
+
+def _split_fused_routed_expert_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Accept checkpoints that store routed experts as fused projections.
+
+    Some DeepSeek-V4-Flash repacks (e.g. the K128 one) name the routed
+    experts ``ffn.experts.{e}.gate_up_proj`` / ``down_proj`` instead of
+    ``w1``/``w3``/``w2``. Split gate_up (gate first, then up, along dim 0;
+    the same for its per-row scales) so the regular expert mapping applies.
+    """
+    for name, tensor in weights:
+        if ".ffn.experts." in name and ".gate_up_proj." in name:
+            gate, up = tensor.chunk(2, dim=0)
+            yield name.replace(".gate_up_proj.", ".w1."), gate
+            yield name.replace(".gate_up_proj.", ".w3."), up
+        elif ".ffn.experts." in name and ".down_proj." in name:
+            yield name.replace(".down_proj.", ".w2."), tensor
+        else:
+            yield name, tensor
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -200,6 +221,22 @@ def _validate_heterogeneous_routes(
             "Heterogeneous fused MoE routes must have exactly "
             f"{expected_columns} columns, got {topk_weights.shape[1]}."
         )
+
+
+def _attention_cls() -> type[DeepseekV4ROCMAiterMLAAttention]:
+    """RDNA keeps attention in fp16 with its own HIP kernels; CDNA is bf16."""
+    from vllm.platforms.rdna import on_rdna_family
+
+    if on_rdna_family():
+        from vllm.models.deepseek_v4.amd.rdna import ops as rdna_ops
+
+        if rdna_ops.has_sparse_mla_decode() and rdna_ops.has_sparse_mla_prefill():
+            from vllm.models.deepseek_v4.amd.rdna.attention import (
+                DeepseekV4RDNAAttention,
+            )
+
+            return DeepseekV4RDNAAttention
+    return DeepseekV4ROCMAiterMLAAttention
 
 
 def _heterogeneous_shared_expert_enabled(vllm_config: VllmConfig) -> bool:
@@ -724,7 +761,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = DeepseekV4ROCMAiterMLAAttention(
+        self.attn = _attention_cls()(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
@@ -1159,6 +1196,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = _split_fused_routed_expert_weights(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w1", 0),

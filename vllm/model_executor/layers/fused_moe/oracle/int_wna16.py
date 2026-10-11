@@ -62,6 +62,7 @@ class WNA16MoEBackend(Enum):
     XPU = "XPU"
     EMULATION = "EMULATION"
     RDNA3 = "RDNA3"
+    RDNA2_W4A16 = "RDNA2_W4A16"
 
 
 def backend_to_kernel_cls(
@@ -118,6 +119,12 @@ def backend_to_kernel_cls(
         )
 
         return [Rdna3WNA16Experts]
+    elif backend == WNA16MoEBackend.RDNA2_W4A16:
+        from vllm.model_executor.layers.fused_moe.experts.rdna2_w4a16_moe import (
+            RDNA2W4A16MoEExperts,
+        )
+
+        return [RDNA2W4A16MoEExperts]
     else:
         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
 
@@ -129,16 +136,30 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
     if current_platform.is_xpu():
         return [WNA16MoEBackend.XPU]
 
-    return [
-        # Native HIP kernel, gated on gfx1100 by _supports_current_device().
-        WNA16MoEBackend.RDNA3,
-        WNA16MoEBackend.FLASHINFER_TRTLLM,
-        WNA16MoEBackend.MARLIN,
-        WNA16MoEBackend.BATCHED_MARLIN,
-        WNA16MoEBackend.TRITON,
-        WNA16MoEBackend.HUMMING,
-        WNA16MoEBackend.EMULATION,
-    ]
+    backends: list[WNA16MoEBackend] = []
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx10x
+
+        # Native RDNA2 (gfx1030) HIP kernel, only when the op is built.
+        if (
+            on_gfx10x()
+            and hasattr(torch.ops, "_rocm_C")
+            and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_rdna2")
+        ):
+            backends.append(WNA16MoEBackend.RDNA2_W4A16)
+    backends.extend(
+        [
+            # Native HIP kernel, gated on gfx1100 by _supports_current_device().
+            WNA16MoEBackend.RDNA3,
+            WNA16MoEBackend.FLASHINFER_TRTLLM,
+            WNA16MoEBackend.MARLIN,
+            WNA16MoEBackend.BATCHED_MARLIN,
+            WNA16MoEBackend.TRITON,
+            WNA16MoEBackend.HUMMING,
+            WNA16MoEBackend.EMULATION,
+        ]
+    )
+    return backends
 
 
 def _backend_incompatibility_reason(
@@ -151,6 +172,19 @@ def _backend_incompatibility_reason(
 ) -> str | None:
     if backend == WNA16MoEBackend.FLASHINFER_TRTLLM and (may_have_zp or may_have_bias):
         return "zero points and bias are not supported"
+
+    if backend == WNA16MoEBackend.RDNA2_W4A16:
+        # moe_gptq_gemm_rdna2: symmetric int4, group-wise, no act-order.
+        # Compressed-tensors goes through CompressedTensorsWNA16RDNA2MoEMethod;
+        # GPTQ MoeWNA16 checkpoints use _process_weights_rdna2.
+        if may_have_zp:
+            return "asymmetric checkpoints are not supported"
+        if may_have_bias:
+            return "expert bias is not supported"
+        if getattr(quant_config, "weight_bits", 4) != 4:
+            return "only 4-bit weights are supported"
+        if getattr(quant_config, "desc_act", False):
+            return "GPTQ activation ordering is not supported"
 
     if backend == WNA16MoEBackend.RDNA3:
         if not isinstance(quant_config, QuantizationArgs):
@@ -426,6 +460,9 @@ def make_wna16_moe_kernel(
     from vllm.model_executor.layers.fused_moe.experts.int4_emulation_moe import (
         Int4EmulationTritonExperts,
     )
+    from vllm.model_executor.layers.fused_moe.experts.rdna2_w4a16_moe import (
+        RDNA2W4A16MoEExperts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.rdna3_moe import (
         Rdna3WNA16Experts,
     )
@@ -450,6 +487,7 @@ def make_wna16_moe_kernel(
         ZentorchExpertsInt4,
         Int4EmulationTritonExperts,
         Rdna3WNA16Experts,
+        RDNA2W4A16MoEExperts,
     )
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
@@ -902,6 +940,44 @@ def _synthesize_rdna3_qzeros(
         device=device,
     )
     return pack_quantized_values_into_int32(zeros, scalar_types.uint4b8, packed_dim=1)
+
+
+def _process_weights_rdna2(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group_size: int,
+) -> tuple[
+    torch.Tensor,  # w13_qweight
+    torch.Tensor,  # w2_qweight
+    torch.Tensor,  # w13_scales
+    torch.Tensor,  # w2_scales
+    torch.Tensor | None,  # w13_qzeros
+    torch.Tensor | None,  # w2_qzeros
+    torch.Tensor | None,  # w13_input_global_scale
+    torch.Tensor | None,  # w2_input_global_scale
+    torch.Tensor | None,  # w13_bias
+    torch.Tensor | None,  # w2_bias
+]:
+    """RDNA2 (gfx1030) symmetric W4A16 MoE weight post-processing.
+
+    Canonical N-first ``[E, N, K // 8]`` int32 (int4 packed along K) and
+    ``[E, N, groups]`` scales become the K-first ``[E, K // 8, N]`` /
+    ``[E, groups, N]`` layout ``moe_gptq_gemm_rdna2`` reads, with the exllama
+    nibble shuffle and synthesized symmetric zero points (as
+    CompressedTensorsWNA16RDNA2MoEMethod does for compressed-tensors).
+    """
+    # MoeWNA16 keeps the packed weights as uint8 [E, N, K // 2]: the bytes
+    # of the int32 [E, N, K // 8] words (little-endian, nibble order kept).
+    if w13.dtype in (torch.uint8, torch.int8):
+        w13 = w13.contiguous().view(torch.int32)
+        w2 = w2.contiguous().view(torch.int32)
+    w13 = w13.transpose(1, 2).contiguous()
+    w2 = w2.transpose(1, 2).contiguous()
+    w13_scale = w13_scale.transpose(1, 2).contiguous()
+    w2_scale = w2_scale.transpose(1, 2).contiguous()
+    return _process_weights_rdna3(w13, w2, w13_scale, w2_scale, group_size)
 
 
 def _process_weights_rdna3(
@@ -1423,6 +1499,11 @@ def _process_weights_emulation_gptq(
         w2_out:  [E, K, N]    bfloat16
     """
     # Canonical N-first → K-first for dequantization.
+    # MoeWNA16 keeps the packed weights as uint8 [E, N, K // 2]: the bytes
+    # of the int32 [E, N, K // 8] words (little-endian, nibble order kept).
+    if w13.dtype in (torch.uint8, torch.int8):
+        w13 = w13.contiguous().view(torch.int32)
+        w2 = w2.contiguous().view(torch.int32)
     w13 = w13.transpose(1, 2).contiguous()
     w2 = w2.transpose(1, 2).contiguous()
     w13_scale = w13_scale.transpose(1, 2).contiguous()
@@ -1655,6 +1736,10 @@ def convert_to_wna16_moe_kernel_format(
                 w13_bias,
                 w2_bias,
             )
+    elif backend == WNA16MoEBackend.RDNA2_W4A16:
+        rdna2_group_size = getattr(quant_config, "group_size", None)
+        assert isinstance(rdna2_group_size, int) and rdna2_group_size > 0
+        return _process_weights_rdna2(w13, w2, w13_scale, w2_scale, rdna2_group_size)
     elif backend == WNA16MoEBackend.RDNA3:
         assert isinstance(quant_config, QuantizationArgs)
         return _process_weights_rdna3(

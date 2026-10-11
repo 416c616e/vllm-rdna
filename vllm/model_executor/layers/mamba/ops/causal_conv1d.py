@@ -5,10 +5,13 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
+import os
+
 import numpy as np
 import torch
 
 from vllm.platforms import current_platform
+from vllm.platforms.rdna import on_rdna2
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
@@ -709,6 +712,53 @@ def causal_conv1d_fn(
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
 
+    # RDNA2 HIP dispatch: varlen prefill path on gfx1030. The Triton
+    # _causal_conv1d_fwd_kernel above captures scratch buffer pointers
+    # that go stale on cudagraph replay (page-not-present faults).
+    # Our HIP causal_conv1d_fwd_rdna2 keeps per-warp scratch in shared
+    # memory and is cudagraph-safe.
+    #
+    # ENABLED default on gfx1030 (2026-09-13): verified HIP vs Triton
+    # identical (out/state maxdiff 0.0) across varlen/mixed-has-init/
+    # transposed-x/seqlen<state_len cases. The null-block (NULL_BLOCK_ID=0)
+    # pass-through is handled in the HIP kernel (the Triton returns early
+    # for a null state slot, leaving the output = x). Set
+    # VLLM_CAUSAL_CONV1D_RDNA2_FWD=0 to fall back to the Triton kernel.
+    if (
+        os.environ.get("VLLM_CAUSAL_CONV1D_RDNA2_FWD", "1") == "1"
+        and on_rdna2()
+        and x.dtype == torch.float16
+        and conv_states.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and is_channel_last
+        and dim % 32 == 0
+        and 2 <= width <= 5
+        # HIP fwd requires state_len == width - 1; spec decoding sizes the
+        # conv state as width - 1 + num_spec, so fall back to Triton there.
+        and conv_states.size(2) == width - 1
+        and cache_indices is not None
+        and block_idx_last_scheduled_token is None
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "causal_conv1d_fwd_rdna2")
+    ):
+        torch.ops._rocm_C.causal_conv1d_fwd_rdna2(
+            x,
+            weight,
+            bias
+            if bias is not None
+            else torch.empty(0, device=x.device, dtype=x.dtype),
+            conv_states,
+            query_start_loc,
+            cache_indices,
+            has_initial_state
+            if has_initial_state is not None
+            else torch.empty(0, device=x.device, dtype=torch.bool),
+            out,
+            activation in ("silu", "swish"),
+            null_block_id,
+        )
+        return out.to(original_x_dtype)
+
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -1228,6 +1278,47 @@ def causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    # HIP decode conv1d MUST run instead of Triton, not after it.
+    # Triton scratch pointers go stale inside a FULL cudagraph replay.
+    if (
+        os.environ.get("VLLM_CAUSAL_CONV1D_RDNA2_UPDATE", "1") == "1"
+        and on_rdna2()
+        and seqlen == 1
+        and query_start_loc is None
+        and num_accepted_tokens is None
+        and block_idx_last_scheduled_token is None
+        and initial_state_idx is None
+        and conv_state_indices is not None
+        and conv_state_indices.dim() == 1
+        and x.dtype == torch.float16
+        and conv_state.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and (out.dtype == torch.float16 if out is not None else True)
+        and dim % 32 == 0
+        # Same spec-state guard as the fwd dispatch: HIP update requires
+        # state_len == width - 1, so Triton handles the spec-sized state.
+        and conv_state.size(2) == width - 1
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "causal_conv1d_update_rdna2")
+    ):
+        # The kernel takes every stride (x/out/weight and the transposed
+        # paged conv_state view), so nothing is copied and `out` is written
+        # in place like the Triton path.
+        torch.ops._rocm_C.causal_conv1d_update_rdna2(
+            x,
+            conv_state,
+            weight,
+            bias
+            if bias is not None
+            else torch.empty(0, device=x.device, dtype=x.dtype),
+            out,
+            conv_state_indices,
+            activation in ("silu", "swish"),
+        )
+        if unsqueeze:
+            out = out.squeeze(-1)
+        return out.to(original_x_dtype)
+
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1273,6 +1364,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
+
     if unsqueeze:
         out = out.squeeze(-1)
     return out.to(original_x_dtype)

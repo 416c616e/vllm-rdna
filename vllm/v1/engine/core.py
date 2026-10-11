@@ -125,6 +125,7 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        self._prefill_step_counter = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -212,6 +213,9 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
+        # Step timing for the scheduler's decode-stall bound.
+        self._step_submit_ts: dict[int, float] = {}
+        self._last_step_done_ts = 0.0
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
@@ -622,10 +626,33 @@ class EngineCore:
         else:
             eco.scheduler_stats.iteration_details = iteration_details
 
+    def _record_step_time(
+        self, scheduler_output: SchedulerOutput, start_ts: float
+    ) -> None:
+        """Feed a finished step's duration to the scheduler (decode-stall
+        bound, SchedulerConfig.decode_stall_budget_ms)."""
+        now = time.monotonic()
+        self._last_step_done_ts = now
+        record = getattr(self.scheduler, "record_step_time", None)
+        if record is not None and scheduler_output.total_num_scheduled_tokens > 0:
+            record(scheduler_output, now - start_ts)
+
+    @staticmethod
+    def _prefill_defer_step(step: int, interval: int) -> bool:
+        return interval > 1 and step % interval != 0
+
     def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise."""
-        return False
+        """Whether to defer new prefills this step (prefill step cadence).
+
+        With SchedulerConfig.prefill_schedule_interval > 1, prefills are
+        admitted only on every interval-th engine step so decoders get
+        pure-decode steps in between. Default 1 disables it. DP engine cores
+        override this with the cross-rank-aligned cadence.
+        """
+        scheduler_config = self.vllm_config.scheduler_config
+        return self._prefill_defer_step(
+            self._prefill_step_counter, scheduler_config.prefill_schedule_interval
+        )
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -637,7 +664,9 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        self._prefill_step_counter += 1
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        step_t0 = time.monotonic()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -647,6 +676,7 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        self._record_step_time(scheduler_output, step_t0)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -694,6 +724,7 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            self._prefill_step_counter += 1
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -722,6 +753,7 @@ class EngineCore:
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
+                self._step_submit_ts[id(scheduler_output)] = time.monotonic()
                 batch_queue.appendleft((future, scheduler_output, exec_future))
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
@@ -748,6 +780,13 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        submit_ts = self._step_submit_ts.pop(id(scheduler_output), None)
+        if submit_ts is not None:
+            # Steps overlap in the queue: a step's own time starts when the
+            # previous one finished, or when it was submitted if later.
+            self._record_step_time(
+                scheduler_output, max(submit_ts, self._last_step_done_ts)
+            )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -2242,9 +2281,8 @@ class DPEngineCoreProc(EngineCoreProc):
         # Throttle new prefills to cadence-aligned steps for DP balancing.
         # step_counter is identical across DP ranks. On a fresh wave the
         # counter is 0, so prefills are admitted immediately after idle.
-        return (
-            self.prefill_schedule_interval > 1
-            and self.step_counter % self.prefill_schedule_interval != 0
+        return self._prefill_defer_step(
+            self.step_counter, self.prefill_schedule_interval
         )
 
     @fault_tolerant_wrapper

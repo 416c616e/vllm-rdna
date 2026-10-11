@@ -50,6 +50,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.machete import (
 from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
     MarlinLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.rdna2_w4a16 import (
+    RDNA2W4A16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
     RDNA3W4A16LinearKernel,
 )
@@ -213,6 +216,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.rdna2_w8a16_fp8_block import (
+    RDNA2W8A16Fp8BlockLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
@@ -337,6 +343,12 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     },
     "exllama": {
         ExllamaLinearKernel,
+    },
+    "rdna2": {
+        RDNA2W4A16LinearKernel,
+    },
+    "rdna_hybrid": {
+        RDNAHybridW4A16LinearKernel,
     },
     "emulation": {
         EmulationMxfp8LinearKernel,
@@ -466,6 +478,10 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
         BlockWiseTorchFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        # gfx1030 only (is_supported): fp16 activations x fp8 weights on
+        # v_dot2_f32_f16, ~6-20x the Triton fp8 path at decode shapes,
+        # which emulates the fp8 MMA there.
+        RDNA2W8A16Fp8BlockLinearKernel,
         AiterFp8BlockScaledMMKernel,
         TritonFp8BlockScaledMMKernel,
     ],
@@ -508,6 +524,9 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         HummingLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        # gfx1030 auto must keep RDNA2 ahead of Hybrid. Hybrid is eligible
+        # on gfx10 too; force it with --linear-backend rdna_hybrid.
+        RDNA2W4A16LinearKernel,
         RDNA3W4A16LinearKernel,
         RDNAHybridW4A16LinearKernel,
         TritonW4A16LinearKernel,

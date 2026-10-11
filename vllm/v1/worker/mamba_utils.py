@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import os
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -476,7 +477,16 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+    # The captured block tables are the SOURCE per-request-slot tables
+    # (persistent [max_num_reqs, max_blocks], mutated only by stream-ordered
+    # staged writes), so rows are always request-state slots -- index them by
+    # req_idx. Indexing by batch row reads the CURRENT step's table at a stale
+    # batch mapping: on a non-last PP rank the deferred postprocess runs
+    # pp_size steps after its batch was gathered, so batch rows point at
+    # DIFFERENT requests and the state copy walks another request's
+    # freed/reallocated block ids (all-NaN logits -> constant-token loops).
+    # (Port of vllm-project/vllm#55506.)
+    bt_row_idx = req_idx
     _copy_mamba_state_block(
         state_idx,
         bt_row_idx,
@@ -610,7 +620,8 @@ def precopy_mamba_align_fused_kernel(
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
-        batch_idx,
+        # Source tables are req-indexed (see postprocess_mamba_fused_kernel).
+        req_idx,
         src_col,
         dst_col,
         token_bias,
@@ -757,6 +768,26 @@ class MambaCopyBuffers:
         )
         n = max_num_reqs * entries_per_req
 
+        if os.environ.get("VLLM_MAMBA_COPY_DEBUG") == "1":
+            logger.warning(
+                "[mamba-copy] create: group_ids=%s entries_per_req=%d n=%d",
+                mamba_group_ids,
+                entries_per_req,
+                n,
+            )
+            for gid in mamba_group_ids:
+                group = kv_cache_config.kv_cache_groups[gid]
+                for layer_name in group.layer_names:
+                    spec = _get_mamba_spec_for_layer(group, layer_name)
+                    logger.warning(
+                        "[mamba-copy]   gid=%d layer=%s type=%s n_funcs=%d shapes=%s",
+                        gid,
+                        layer_name,
+                        spec.mamba_type,
+                        len(copy_funcs[spec.mamba_type]),
+                        spec.shapes,
+                    )
+
         return cls(
             src_ptrs=make_buffer(n, dtype=torch.uint64),
             dst_ptrs=make_buffer(n, dtype=torch.uint64),
@@ -809,6 +840,16 @@ class MambaSpecDecodeGPUContext:
     # table tensors (whose data_ptr is stable across steps).
     block_table_ptrs: torch.Tensor
     block_table_stride_req: int = 0
+
+    # Base addresses of the batch-ordered block tables the aligned-index
+    # kernel reads (the persistent gathered ``input_block_tables``: row i is
+    # batch row i, padded/dummy rows are zero). ``block_table_ptrs`` above are
+    # the SOURCE per-request-slot tables the copy kernels index by req_idx
+    # (port of #55506); the aligned indices must not read those by batch row.
+    batch_block_table_ptrs: torch.Tensor | None = None
+    batch_block_table_stride_req: int = 0
+    _block_table_key: tuple[int, ...] = ()
+    _batch_block_table_key: tuple[int, ...] = ()
 
     # persistent output for the once-per-step, all-group aligned-index launch.
     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
@@ -898,6 +939,9 @@ class MambaSpecDecodeGPUContext:
                 max_num_reqs, dtype=torch.int32, device=device
             ),
             block_table_ptrs=torch.zeros(
+                len(mamba_group_ids), dtype=torch.int64, device=device
+            ),
+            batch_block_table_ptrs=torch.zeros(
                 len(mamba_group_ids), dtype=torch.int64, device=device
             ),
             aligned_state_indices=torch.empty(
@@ -1076,6 +1120,13 @@ class MambaSpecDecodeGPUContext:
         # `block_tables[i]` is the persistent 2D int32 block-table tensor for
         # `mamba_group_ids[i]`; `data_ptr()` / `stride(0)` are stable for the
         # engine's lifetime, so we capture them once here.
+        self.bind_block_tables(block_tables)
+
+        self.is_initialized = True
+
+    def _write_block_table_ptrs(
+        self, block_tables: list[torch.Tensor], ptrs: torch.Tensor
+    ) -> tuple[tuple[int, ...], int]:
         assert len(block_tables) == self.num_groups, (
             f"expected {self.num_groups} block tables, got {len(block_tables)}"
         )
@@ -1083,11 +1134,35 @@ class MambaSpecDecodeGPUContext:
         assert len(strides) == 1, (
             f"all mamba block tables must share stride(0), got {strides}"
         )
-        self.block_table_stride_req = int(next(iter(strides)))
-        for i, bt in enumerate(block_tables):
-            self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
+        key = tuple(bt.data_ptr() for bt in block_tables)
+        for i, ptr in enumerate(key):
+            ptrs[i] = _reinterpret_u64_as_i64(ptr)
+        return key, int(next(iter(strides)))
 
-        self.is_initialized = True
+    def bind_block_tables(self, block_tables: list[torch.Tensor]) -> None:
+        """Point the copy kernels at ``block_tables`` (no-op if unchanged).
+
+        The copy kernels index rows by req_idx, so these must be the SOURCE
+        per-request-slot tables. A context first initialized from batch-order
+        tables (a dummy/capture run before any real step) is re-pointed here
+        by the first real ``preprocess_state``.
+        """
+        key = tuple(bt.data_ptr() for bt in block_tables)
+        if key == self._block_table_key:
+            return
+        self._block_table_key, self.block_table_stride_req = (
+            self._write_block_table_ptrs(block_tables, self.block_table_ptrs)
+        )
+
+    def bind_batch_block_tables(self, block_tables: list[torch.Tensor]) -> None:
+        """Point the aligned-index kernel at the batch-ordered block tables."""
+        assert self.batch_block_table_ptrs is not None
+        key = tuple(bt.data_ptr() for bt in block_tables)
+        if key == self._batch_block_table_key:
+            return
+        self._batch_block_table_key, self.batch_block_table_stride_req = (
+            self._write_block_table_ptrs(block_tables, self.batch_block_table_ptrs)
+        )
 
     def compute_aligned_state_indices(
         self,
@@ -1106,11 +1181,19 @@ class MambaSpecDecodeGPUContext:
         num_state_slots = self.aligned_state_indices.shape[2]
         block_rows = 32
         grid = (triton.cdiv(num_reqs, block_rows),)
+        # Batch row i reads batch-ordered block-table row i. Fall back to the
+        # copy kernels' tables only when no batch tables were bound (V1).
+        if self._batch_block_table_key:
+            block_table_ptrs = self.batch_block_table_ptrs
+            block_table_stride_req = self.batch_block_table_stride_req
+        else:
+            block_table_ptrs = self.block_table_ptrs
+            block_table_stride_req = self.block_table_stride_req
         get_aligned_state_indices_multi_group_kernel[grid](
-            self.block_table_ptrs,
+            block_table_ptrs,
             seq_lens,
             self.aligned_state_indices,
-            self.block_table_stride_req,
+            block_table_stride_req,
             seq_lens.stride(0),
             self.aligned_state_indices.stride(0),
             self.aligned_state_indices.stride(1),
@@ -1347,6 +1430,15 @@ def collect_mamba_copy_meta(
     sizes_np = copy_bufs.sizes.np
     offset = copy_bufs.offset
 
+    debug = os.environ.get("VLLM_MAMBA_COPY_DEBUG") == "1"
+    if debug:
+        logger.warning(
+            "[mamba-copy] collect: src_blk=%d dst_blk=%d bias=%d group_ids=%s",
+            src_block_idx,
+            dest_block_idx,
+            accept_token_bias,
+            mamba_group_ids,
+        )
     for mamba_group_id in mamba_group_ids:
         block_ids = req_state.block_ids[mamba_group_id]
         dest_block_id = block_ids[dest_block_idx]
@@ -1357,6 +1449,18 @@ def collect_mamba_copy_meta(
             state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
+            if debug:
+                logger.warning(
+                    "[mamba-copy]   gid=%d layer=%s type=%s n_kv=%d n_funcs=%d"
+                    " src_blk_id=%s dst_blk_id=%s",
+                    mamba_group_id,
+                    layer_name,
+                    mamba_spec.mamba_type,
+                    len(kv_caches),
+                    len(state_copy_funcs),
+                    block_ids[src_block_idx],
+                    dest_block_id,
+                )
             for state, state_copy_func in zip(kv_caches, state_copy_funcs):
                 copy_spec = state_copy_func(
                     state, block_ids, src_block_idx, accept_token_bias + 1
@@ -1368,6 +1472,8 @@ def collect_mamba_copy_meta(
                 offset += 1
 
     copy_bufs.offset = offset
+    if debug:
+        logger.warning("[mamba-copy]   wrote %d entries", offset)
 
 
 def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
@@ -1473,6 +1579,13 @@ def preprocess_mamba(
         fused.src_col.np[:num_reqs] = -1
         fused.token_bias.np[:num_reqs] = 0
 
+    if os.environ.get("VLLM_MAMBA_COPY_DEBUG") == "1":
+        logger.warning(
+            "[mamba-copy] preprocess: num_reqs=%d fused=%s block_size=%d",
+            num_reqs,
+            fused is not None,
+            block_size,
+        )
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
@@ -1499,6 +1612,18 @@ def preprocess_mamba(
         mamba_state_idx[req_id] = curr_state_idx
         if fused is not None:
             fused.state_idx.np[i] = curr_state_idx
+
+        if os.environ.get("VLLM_MAMBA_COPY_DEBUG") == "1":
+            logger.warning(
+                "[mamba-copy] preprocess req=%s prev=%d curr=%d ncomp=%d"
+                " nsched=%d nblocks=%d",
+                req_id,
+                prev_state_idx,
+                curr_state_idx,
+                req_state.num_computed_tokens,
+                num_scheduled_tokens,
+                num_blocks,
+            )
 
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1

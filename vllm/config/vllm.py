@@ -122,7 +122,15 @@ def default_breakable_cudagraph_architectures() -> frozenset[str]:
         # FULL_AND_PIECEWISE then dies at capture unless breakable CUDA
         # graphs are on. Enable this architecture so the published AMD
         # recipe can start.
-        return frozenset({"DeepseekV41ForCausalLM"})
+        archs = {"DeepseekV41ForCausalLM"}
+        from vllm.platforms.rdna import on_rdna_family
+
+        if on_rdna_family():
+            # RDNA: the Qwen3.5/3.8 hybrid GDN prefill chain faults under
+            # cudagraph capture (host-VA page-not-present on unallocated
+            # scratch); keep it eager via @eager_break_during_capture.
+            archs |= {"Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"}
+        return frozenset(archs)
     return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
 
 

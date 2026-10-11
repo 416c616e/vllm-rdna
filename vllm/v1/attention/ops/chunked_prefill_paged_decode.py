@@ -12,6 +12,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.rdna import on_rdna2
 from vllm.triton_utils import tl, triton
 
 from .prefix_prefill import context_attention_fwd
@@ -385,8 +386,9 @@ def chunked_prefill_paged_decode(
     # Force Triton for non-standard blocks like Qwen3's 544 and for
     # stride-padded hybrid layouts. The latter use reshape_and_cache_flash
     # during cache update, so keep decode on the matching stride-aware path.
+    # RDNA2's FA-RDNA2 kernels take block_size as a runtime arg.
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
-    if not is_pow2 or not has_native_layout:
+    if (not is_pow2 and not on_rdna2()) or not has_native_layout:
         use_custom = False
 
     if use_custom:

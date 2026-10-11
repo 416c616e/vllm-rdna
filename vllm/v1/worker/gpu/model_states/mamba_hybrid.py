@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
+from vllm.platforms.rdna import on_rdna_family
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -108,14 +109,24 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
 
+    def set_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
+        if self._align_mode:
+            self._get_mamba_group_info(kv_cache_config)
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
+            # RDNA: the state table uses Mamba blocks, not the minimum cache
+            # grid (they differ in the Flash-Next hybrid layout).
+            block_size = self.cache_config.block_size
+            if on_rdna_family():
+                assert self._mamba_spec is not None
+                block_size = self._mamba_spec.block_size
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1) // block_size
             )
 
     def _get_mamba_group_info(
@@ -196,6 +207,10 @@ class MambaHybridModelState(DefaultModelState):
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+        # The copy kernels below index these SOURCE tables by req_idx. If a
+        # dummy/capture run initialized the context first, it holds the
+        # batch-ordered tables: re-point it before the first copy.
+        ctx.bind_block_tables([block_tables[gid] for gid in mamba_group_ids])
 
         # The state-advance + pre-copy kernels run every step; they fast-exit per
         # request when src_col < 0 or src_col == dst_col, so no copy happens on
@@ -302,6 +317,12 @@ class MambaHybridModelState(DefaultModelState):
             if aligned_index_builders:
                 ctx = self._ensure_align_ctx(
                     kv_cache_config, mamba_group_ids, block_tables
+                )
+                # Aligned indices are per batch row: read the batch-ordered
+                # gathered tables (zero rows for dummies), not the per-slot
+                # source tables the copy kernels use.
+                ctx.bind_batch_block_tables(
+                    [block_tables[gid] for gid in mamba_group_ids]
                 )
                 all_group_indices = ctx.compute_aligned_state_indices(
                     input_batch.seq_lens, num_reqs

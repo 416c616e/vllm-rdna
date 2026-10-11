@@ -3,7 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from einops import rearrange
@@ -48,6 +48,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.platforms.rdna import on_rdna2, on_rdna_family
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
 )
@@ -65,7 +66,15 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    alloc_gdn_state_arenas,
+    gather_gdn_state_arenas,
+    gdn_arenas_ready_for_capture,
+    gdn_decode_arena_max_bs,
+    scatter_gdn_state_arenas,
+    static_gdn_cache_slots,
+)
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -90,9 +99,85 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
+def _gdn_prefill_chain_rdna2(
+    q: torch.Tensor,  # [1, L, Hg, K] fp16 (from prep, B=1)
+    k: torch.Tensor,  # [1, L, Hg, K] fp16
+    v: torch.Tensor,  # [1, L, H, V]  fp16 (H=HV in Qwen3.5/3.6)
+    g_cumsum: torch.Tensor,  # [1, L, H]      fp32 (cumsum'd, from prep)
+    beta: torch.Tensor,  # [1, L, H]      fp32 (from prep)
+    initial_state: torch.Tensor,  # [N, H, V, K]   fp32 (from ssm_state, may be zeros)
+    scale: float,
+    cu_seqlens: torch.Tensor,  # [N+1] int32 (always varlen for prefill)
+    chunk_indices: torch.Tensor,  # [NT, 2] int32
+    chunk_offsets: torch.Tensor,  # [N+1] int32
+    chunk_size: int = FLA_CHUNK_SIZE,
+):
+    """Native HIP prefill chain for gfx1030: replicates chunk.py:23-86 using
+    torch.ops._rocm_C.gdn_prefill_* ops. Returns (o, final_state) matching
+    the Triton `chunk_gated_delta_rule` convention (final_state fp32)."""
+    # The HIP kernels require int32 index tensors. The metadata builder may
+    # hand us int64 (prepare_chunk_offsets' cumsum / async_tensor_h2d with
+    # dtype=None follows the source dtype), so coerce defensively. `.to` is a
+    # no-op when already int32.
+    cu_seqlens = cu_seqlens.to(torch.int32)
+    chunk_indices = chunk_indices.to(torch.int32)
+    chunk_offsets = chunk_offsets.to(torch.int32)
+
+    B, T, Hg, K = q.shape
+    H = g_cumsum.shape[-1]
+    V = v.shape[-1]
+    BT = chunk_size
+
+    A = torch.zeros(B, T, H, BT, dtype=torch.float32, device=q.device)
+    A_inv = torch.zeros(B, T, H, BT, dtype=q.dtype, device=q.device)
+    w = torch.zeros(B, T, H, K, dtype=q.dtype, device=q.device)
+    u = torch.zeros_like(v)
+    NT = chunk_indices.shape[0]
+    # h matches the reference chunk_gated_delta_rule_fwd_h layout: 5D
+    # [B, NT, H, V, K] (B=1 for the varlen prefill path). torch.zeros
+    # (not torch.empty) to commit pages on RDNA2 — cudagraph capture
+    # bakes tensor addresses; uncommitted pages fault on replay.
+    h = torch.zeros(B, NT, H, V, K, dtype=q.dtype, device=q.device)
+    v_new = torch.zeros_like(v)
+    final_state = torch.zeros_like(initial_state)
+
+    ops = torch.ops._rocm_C
+    ops.gdn_prefill_kkt_rdna2(k, beta, g_cumsum, A, cu_seqlens, chunk_indices)
+    ops.gdn_prefill_solve_wy_rdna2(
+        A, k, v, beta, g_cumsum, A_inv, w, u, cu_seqlens, chunk_indices
+    )
+    ops.gdn_prefill_delta_h_rdna2(
+        k,
+        u,
+        w,
+        g_cumsum,
+        h,
+        v_new,
+        initial_state,
+        final_state,
+        cu_seqlens,
+        chunk_offsets,
+        chunk_size,
+    )
+    o = torch.empty_like(v)
+    ops.gdn_prefill_o_rdna2(
+        q, k, v_new, h, g_cumsum, o, scale, cu_seqlens, chunk_offsets
+    )
+    return o, final_state
+
+
+def _gdn_prefill_dispatch_available() -> bool:
+    """True iff the RDNA2 GDN prefill HIP chain is explicitly opted in."""
+    # Opt-in: the HIP chain measured 8.7% slower than Triton/FLA on a 16k
+    # prefill (77.7s vs 70.9s) and 6.4% lower PP at TP=4.
+    if os.environ.get("VLLM_GDN_HIP_PREFILL", "0") != "1":
+        return False
+    return on_rdna2() and hasattr(torch.ops._rocm_C, "gdn_prefill_prep_rdna2")
+
+
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "rdna2"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -106,6 +191,10 @@ def _resolve_gdn_prefill_backend(
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
     * Blackwell (SM10.x) with ``head_k_dim == 128``;
+
+    Native RDNA2 HIP chain is chosen when:
+    * ``platform == rocm`` and ``on_gfx10x()`` and
+      ``_gdn_prefill_dispatch_available()``.
     """
     additional_config = vllm_config.additional_config
     backend_cfg = (
@@ -114,6 +203,9 @@ def _resolve_gdn_prefill_backend(
         else "auto"
     )
     backend = str(backend_cfg).strip().lower()
+
+    if current_platform.is_rocm() and _gdn_prefill_dispatch_available():
+        return backend, "rdna2"
 
     if not current_platform.is_cuda():
         return backend, "triton"
@@ -172,6 +264,7 @@ def _log_gdn_backend_decision(
     chosen = {
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
+        "rdna2": "RDNA2 HIP",
         "triton": "Triton/FLA",
     }[active_backend]
     logger.info_once(
@@ -415,7 +508,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._forward_method = self.forward_hip
         else:
             self._forward_method = self.forward_cuda
-
+        # RDNA: the whole layer runs as the opaque qwen_gdn_full_forward op.
+        # VLLM_RDNA_GDN_OPAQUE=0 keeps the projections in the compiled graph
+        # (only the attention core stays opaque, as upstream).
+        self._rdna_opaque_forward = on_rdna_family() and (
+            os.environ.get("VLLM_RDNA_GDN_OPAQUE", "1") != "0"
+        )
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = ColumnParallelLinear(
@@ -493,7 +591,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             group_size=None,
             norm_before_gate=True,
             activation=output_gate_type,
-            device=current_platform.current_device(),
+            device=self.A_log.device,
         )
 
         self.out_proj = RowParallelLinear(
@@ -509,6 +607,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        self._decode_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
@@ -531,11 +630,104 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+        self._gdn_arena_max_bs = gdn_decode_arena_max_bs(vllm_config, self.num_spec)
+        self._conv_state_arena: torch.Tensor | None = None
+        self._ssm_state_arena: torch.Tensor | None = None
+        # Allocate before any decode / BeginCapture. Lazy alloc on first
+        # decode can run under capture and bake a new data_ptr into the graph.
+        mode = vllm_config.compilation_config.cudagraph_mode
+        if mode is not None and bool(mode) and on_rdna_family():
+            self._init_gdn_state_arenas()
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _init_gdn_state_arenas(self) -> None:
+        """Permanent arenas on the layer device, before first BeginCapture."""
+        conv_shape, ssm_shape = self.get_state_shape()[:2]
+        if not is_conv_state_dim_first():
+            conv_shape = (*conv_shape[:-2], conv_shape[-1], conv_shape[-2])
+        conv_dtype, ssm_dtype = self.get_state_dtype()[:2]
+        device = self.A_log.device
+        if device.type == "meta":
+            device = torch.device("cpu")
+        conv_arena, ssm_arena = alloc_gdn_state_arenas(
+            self._gdn_arena_max_bs,
+            conv_shape,
+            ssm_shape,
+            conv_dtype,
+            ssm_dtype,
+            device,
+        )
+        self._conv_state_arena = conv_arena
+        self._ssm_state_arena = ssm_arena
+
+    def _ensure_gdn_state_arenas(
+        self, conv_state: torch.Tensor, ssm_state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        capturing = bool(
+            conv_state.is_cuda
+            and torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        )
+        gdn_arenas_ready_for_capture(
+            self._conv_state_arena, self._ssm_state_arena, capturing
+        )
+        if self._conv_state_arena is None or self._ssm_state_arena is None:
+            self._conv_state_arena, self._ssm_state_arena = alloc_gdn_state_arenas(
+                self._gdn_arena_max_bs,
+                tuple(conv_state.shape[1:]),
+                tuple(ssm_state.shape[1:]),
+                conv_state.dtype,
+                ssm_state.dtype,
+                conv_state.device,
+            )
+        return self._conv_state_arena, self._ssm_state_arena
+
+    def _bind_decode_state_arenas(
+        self,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        num: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not attn_metadata.use_state_arenas:
+            return conv_state, ssm_state
+        cache_slots = static_gdn_cache_slots(
+            attn_metadata.cache_slot_indices,
+            attn_metadata.cache_slot_indices_is_static,
+        )
+        conv_arena, ssm_arena = self._ensure_gdn_state_arenas(conv_state, ssm_state)
+        gather_gdn_state_arenas(
+            conv_state, ssm_state, conv_arena, ssm_arena, cache_slots, num
+        )
+        return conv_arena, ssm_arena
+
+    def _unbind_decode_state_arenas(
+        self,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        num: int,
+    ) -> None:
+        if not attn_metadata.use_state_arenas:
+            return
+        cache_slots = static_gdn_cache_slots(
+            attn_metadata.cache_slot_indices,
+            attn_metadata.cache_slot_indices_is_static,
+        )
+        assert self._conv_state_arena is not None
+        assert self._ssm_state_arena is not None
+        scatter_gdn_state_arenas(
+            conv_state,
+            ssm_state,
+            self._conv_state_arena,
+            self._ssm_state_arena,
+            cache_slots,
+            num,
+        )
 
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
@@ -840,7 +1032,39 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self._forward_method(hidden_states)
+        if not self._rdna_opaque_forward:
+            return self._forward_method(hidden_states)
+        # Allocated outside the eager break, so breakable capture records it
+        # in the graph pool and replays write the address later segments read.
+        output = torch.empty_like(hidden_states)
+        return self._rdna_full_forward(hidden_states, output)
+
+    @eager_break_during_capture
+    def _rdna_full_forward(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        # RDNA: opaque full-layer custom op (OLMo pattern). Needed so dynamo
+        # does not trace into GDN RMSNorm / conv1d (device_index skip).
+        return torch.ops.vllm.qwen_gdn_full_forward(
+            hidden_states,
+            output,
+            _encode_layer_name(self.prefix),
+        )
+
+    def _full_forward(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        result = self._forward_method(hidden_states)
+        num_tokens = result.shape[0]
+        output[:num_tokens].copy_(result)
+        logger.info_once(
+            "Qwen GDN full forward running as vllm::qwen_gdn_full_forward "
+            "(opaque to inductor; projections stay eager)"
+        )
 
     def _output_projection(
         self,
@@ -862,6 +1086,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         """ROCm forward using AITER Triton fused projection+attention when
         available, otherwise falling back to the generic CUDA path."""
+        if os.environ.get("VLLM_GDN_NAN_DEBUG") == "1" and not (
+            torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                if bool(torch.isnan(hidden_states).any().item()):
+                    logger.warning(
+                        "[gdn-nan] L%s INPUT nan=True shape=%s",
+                        self.prefix,
+                        tuple(hidden_states.shape),
+                    )
+            except Exception:
+                pass
         if GDN_AITER_TRITON_AVAILABLE:
             num_tokens = hidden_states.size(0)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -1080,6 +1316,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
+        if _gdn_prefill_dispatch_available():
+            return
 
         device = qkv_or_qkvz.device
         dtype = qkv_or_qkvz.dtype
@@ -1181,6 +1419,169 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         torch.accelerator.empty_cache()
 
+    @torch.inference_mode()
+    def _warmup_decode_kernels(self, qkv_or_qkvz: torch.Tensor) -> None:
+        """RDNA: JIT the GDN decode and MTP-verify Triton kernels at profile
+        time.
+
+        The V2 runner's JIT warmup replays scheduler-realistic decode steps,
+        but it is off under ``--enforce-eager`` and absent on the V1 runner.
+        There the first real request compiles the spec-decode kernels
+        mid-inference: the varlen ``causal_conv1d_update`` (with
+        ``num_accepted_tokens``) and ``fused_sigmoid_gating_delta_rule_update``
+        at T = 1 + num_spec, which crashed with ``hipErrorIllegalAddress`` on
+        RDNA3. Run each decode path once here, with the cache layouts, index
+        strides and batch shapes (1 and 2 requests) the real calls use, so
+        the compiled variants are cached before the KV cache takes the memory.
+        """
+        if self._decode_kernels_warmed_up:
+            return
+        self._decode_kernels_warmed_up = True
+        if not on_rdna_family():
+            return
+
+        device = qkv_or_qkvz.device
+        dtype = qkv_or_qkvz.dtype
+        conv_dtype, ssm_dtype = self.get_state_dtype()[:2]
+        conv_shape, ssm_shape = self.get_state_shape()[:2]
+        conv_dim = self.conv_dim // self.tp_size
+        num_v_heads = self.num_v_heads // self.tp_size
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        decode_lens = [1] + ([1 + self.num_spec] if self.num_spec > 0 else [])
+
+        def _int32(values) -> torch.Tensor:
+            return torch.tensor(values, device=device, dtype=torch.int32)
+
+        try:
+            for num_reqs in (1, 2):
+                for q_len in decode_lens:
+                    num_tokens = num_reqs * q_len
+                    # Line 0 is the null block; real requests start at 1.
+                    num_lines = 1 + num_tokens
+                    conv_state = torch.zeros(
+                        num_lines, *conv_shape, device=device, dtype=conv_dtype
+                    )
+                    if not is_conv_state_dim_first():
+                        conv_state = conv_state.transpose(-1, -2)
+                    ssm_state = torch.zeros(
+                        num_lines, *ssm_shape, device=device, dtype=ssm_dtype
+                    )
+                    mixed_qkv = torch.randn(
+                        num_tokens, conv_dim, device=device, dtype=dtype
+                    )
+                    a = torch.randn(num_tokens, num_v_heads, device=device, dtype=dtype)
+                    b = torch.randn_like(a)
+                    cu_seqlens = _int32(list(range(0, num_tokens + 1, q_len)))
+                    if q_len > 1:
+                        # MTP verify: [num_reqs, 1 + num_spec] state slots,
+                        # the conv takes column 0 (a strided view).
+                        spec_indices = torch.arange(
+                            1, num_lines, device=device, dtype=torch.int32
+                        ).view(num_reqs, q_len)
+                        num_accepted = _int32([q_len] * num_reqs)
+                        conv_out = causal_conv1d_update(
+                            mixed_qkv,
+                            conv_state,
+                            conv_weights,
+                            self.conv1d.bias,
+                            self.activation,
+                            conv_state_indices=spec_indices[:, 0],
+                            num_accepted_tokens=num_accepted,
+                            query_start_loc=cu_seqlens,
+                            max_query_len=q_len,
+                            validate_data=False,
+                        )
+                        q, k, v = self.rearrange_mixed_qkv(conv_out)
+                        fused_sigmoid_gating_delta_rule_update(
+                            A_log=self.A_log,
+                            a=a,
+                            b=b,
+                            dt_bias=self.dt_bias,
+                            q=q,
+                            k=k,
+                            v=v,
+                            initial_state=ssm_state,
+                            inplace_final_state=True,
+                            cu_seqlens=cu_seqlens,
+                            ssm_state_indices=spec_indices,
+                            num_accepted_tokens=num_accepted,
+                            use_qk_l2norm_in_kernel=True,
+                        )
+                        continue
+                    # Plain decode (and the decode part of mixed batches).
+                    indices = torch.arange(
+                        1, num_lines, device=device, dtype=torch.int32
+                    )
+                    conv_out = causal_conv1d_update(
+                        mixed_qkv,
+                        conv_state,
+                        conv_weights,
+                        self.conv1d.bias,
+                        self.activation,
+                        conv_state_indices=indices,
+                        validate_data=False,
+                    )
+                    q, k, v = self.rearrange_mixed_qkv(conv_out)
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=q,
+                        k=k,
+                        v=v,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=cu_seqlens,
+                        ssm_state_indices=indices,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                    uses_hip_decode = (
+                        on_rdna2()
+                        and self.head_k_dim == 128
+                        and dtype == torch.float16
+                        and ssm_dtype in (torch.float32, torch.float16)
+                        and os.environ.get("VLLM_GDN_DECODE_RDNA2", "1") != "0"
+                        and hasattr(torch.ops._rocm_C, "gdn_decode_rdna2")
+                    )
+                    if self.enable_packed_recurrent_decode and not uses_hip_decode:
+                        fused_recurrent_gated_delta_rule_packed_decode(
+                            mixed_qkv=conv_out,
+                            a=a,
+                            b=b,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            scale=self.head_k_dim**-0.5,
+                            initial_state=ssm_state,
+                            out=torch.empty(
+                                num_tokens,
+                                1,
+                                num_v_heads,
+                                self.head_v_dim,
+                                device=device,
+                                dtype=dtype,
+                            ),
+                            ssm_state_indices=indices,
+                            use_qk_l2norm_in_kernel=True,
+                        )
+        except Exception:
+            logger.warning(
+                "GDN decode kernel warmup failed for layer %s; the first "
+                "request may JIT-compile decode kernels mid-inference.",
+                self.prefix,
+                exc_info=True,
+            )
+        else:
+            logger.debug(
+                "GDN decode kernel warmup (query lens %s) done for layer %s",
+                decode_lens,
+                self.prefix,
+            )
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
     def _forward_core_rocm(
         self,
         qkvz: torch.Tensor,
@@ -1212,6 +1613,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata is None:
             v_dim = core_attn_out.shape[-1] * core_attn_out.shape[-2]
             self._warmup_prefill_kernels(qkvz, v_dim)
+            self._warmup_decode_kernels(qkvz)
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -1266,6 +1668,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
             self._warmup_prefill_kernels(mixed_qkv, 0)
+            self._warmup_decode_kernels(mixed_qkv)
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -1302,6 +1705,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+        paged_conv_state, paged_ssm_state = conv_state, ssm_state
+        conv_state, ssm_state = self._bind_decode_state_arenas(
+            conv_state, ssm_state, attn_metadata, attn_metadata.num_decodes
+        )
+
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
@@ -1410,24 +1818,52 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_prefill = a_non_spec
                 b_prefill = b_non_spec
 
-            (
-                query_non_spec,
-                key_non_spec,
-                value_non_spec,
-                g_non_spec,
-                beta_non_spec,
-            ) = fused_post_conv_prep(
-                conv_output=conv_output_prefill,
-                a=a_prefill,
-                b=b_prefill,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                num_k_heads=self.num_k_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=True,
-                output_g_exp=False,
-            )
+            if _gdn_prefill_dispatch_available():
+                _L = conv_output_prefill.shape[0]
+                _HV = self.num_v_heads // self.tp_size
+                _H = self.num_k_heads // self.tp_size
+                _K = self.head_k_dim
+                _V = self.head_v_dim
+                _dev = conv_output_prefill.device
+                _dtype = conv_output_prefill.dtype
+                query_non_spec = torch.zeros(_L, _H, _K, dtype=_dtype, device=_dev)
+                key_non_spec = torch.zeros(_L, _H, _K, dtype=_dtype, device=_dev)
+                value_non_spec = torch.zeros(_L, _HV, _V, dtype=_dtype, device=_dev)
+                g_non_spec = torch.zeros(_L, _HV, dtype=torch.float32, device=_dev)
+                beta_non_spec = torch.zeros(_L, _HV, dtype=torch.float32, device=_dev)
+                torch.ops._rocm_C.gdn_prefill_prep_rdna2(
+                    conv_output_prefill,
+                    a_prefill,
+                    b_prefill,
+                    self.A_log,
+                    self.dt_bias,
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    attn_metadata.prefill_query_start_loc,
+                    attn_metadata.chunk_indices,
+                )
+            else:
+                (
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                ) = fused_post_conv_prep(
+                    conv_output=conv_output_prefill,
+                    a=a_prefill,
+                    b=b_prefill,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    num_k_heads=self.num_k_heads // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    apply_l2norm=True,
+                    output_g_exp=False,
+                )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
             value_non_spec = value_non_spec.unsqueeze(0)
@@ -1506,18 +1942,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
-                chunk_indices=attn_metadata.chunk_indices,
-                chunk_offsets=attn_metadata.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
+            ) = (
+                _gdn_prefill_chain_rdna2(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g_cumsum=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    scale=self.head_k_dim**-0.5,
+                    cu_seqlens=attn_metadata.prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                )
+                if _gdn_prefill_dispatch_available()
+                else self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=attn_metadata.prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                )
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
@@ -1561,6 +2012,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+        self._unbind_decode_state_arenas(
+            paged_conv_state, paged_ssm_state, attn_metadata, attn_metadata.num_decodes
+        )
 
     def _forward_core_decode_aiter(
         self,
@@ -1649,6 +2104,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+        paged_conv_state, paged_ssm_state = conv_state, ssm_state
+        conv_state, ssm_state = self._bind_decode_state_arenas(
+            conv_state, ssm_state, attn_metadata, attn_metadata.num_decodes
+        )
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -1667,6 +2126,40 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             validate_data=False,
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        if (
+            current_platform.is_rocm()
+            and self.head_k_dim == 128
+            and mixed_qkv_non_spec.dtype == torch.float16
+            and ssm_state.dtype in (torch.float32, torch.float16)
+            and out_buf.dtype == torch.float16
+        ):
+            from vllm.platforms.rocm import on_gfx10x
+
+            if (
+                on_gfx10x()
+                and os.environ.get("VLLM_GDN_DECODE_RDNA2", "1") != "0"
+                and hasattr(torch.ops, "_rocm_C")
+                and hasattr(torch.ops._rocm_C, "gdn_decode_rdna2")
+            ):
+                torch.ops._rocm_C.gdn_decode_rdna2(
+                    mixed_qkv_non_spec,
+                    a,
+                    b,
+                    self.A_log,
+                    self.dt_bias,
+                    out_buf,
+                    ssm_state,
+                    non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+                    self.head_k_dim**-0.5,
+                    True,
+                )
+                self._unbind_decode_state_arenas(
+                    paged_conv_state,
+                    paged_ssm_state,
+                    attn_metadata,
+                    attn_metadata.num_decodes,
+                )
+                return
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
@@ -1678,6 +2171,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             out=out_buf,
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
+        )
+        self._unbind_decode_state_arenas(
+            paged_conv_state, paged_ssm_state, attn_metadata, attn_metadata.num_decodes
         )
         return
 
@@ -1960,4 +2456,52 @@ direct_register_custom_op(
     op_name="qwen_gdn_attention_core_fused_norm_packed",
     op_func=qwen_gdn_attention_core_fused_norm_packed,
     mutates_args=["core_attn_out"],
+)
+
+
+def qwen_gdn_full_forward(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Full Qwen GDN forward wrapped as a custom op.
+
+    Prevents inductor from compiling the projections around the GDN
+    recurrent core. Tiny fp16 differences in fused matmuls compound
+    through the recurrent state and diverge logprobs under cudagraph
+    replay. See OlmoHybridGatedDeltaNetAttention for the same rationale.
+
+    Returns ``output`` so inductor cannot constant-fold the pre-op
+    allocation through the split.
+    """
+    layer_name = _resolve_layer_name(layer_name)
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    self._full_forward(hidden_states=hidden_states, output=output)
+    return output
+
+
+def qwen_gdn_full_forward_fake(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Fake implementation for torch.compile."""
+    return output
+
+
+_gdn_full_forward_tags: tuple[Any, ...] = ()
+if (
+    hasattr(torch, "_C")
+    and hasattr(torch._C, "Tag")
+    and hasattr(torch._C.Tag, "cudagraph_unsafe")
+):
+    _gdn_full_forward_tags = (torch._C.Tag.cudagraph_unsafe,)
+
+direct_register_custom_op(
+    op_name="qwen_gdn_full_forward",
+    op_func=qwen_gdn_full_forward,
+    mutates_args=["output"],
+    fake_impl=qwen_gdn_full_forward_fake,
+    tags=_gdn_full_forward_tags,
 )

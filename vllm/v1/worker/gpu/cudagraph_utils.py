@@ -32,6 +32,7 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.platforms.rdna import on_rdna_family
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import current_stream
@@ -253,6 +254,14 @@ class CudaGraphManager:
             return
 
         capture_sizes = sorted(capture_sizes)
+        # RDNA, decode_query_len=1 (spec decode draft): a [3,6,12,24] ladder
+        # leaves >=7-req batches without a graph, so the draft step runs eager.
+        if (
+            on_rdna_family()
+            and self.decode_query_len == 1
+            and self.max_num_reqs not in capture_sizes
+        ):
+            capture_sizes = sorted({*capture_sizes, self.max_num_reqs})
         max_decode_tokens = self.max_num_reqs * self.decode_query_len
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
@@ -461,14 +470,13 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
-                        # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
                         if self.pool is not None:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
+                        graph = torch.cuda.CUDAGraph()
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
@@ -476,10 +484,6 @@ class CudaGraphManager:
                             graph, self.pool, stream=self._capture_stream(desc)
                         ):
                             forward_fn(CUDAGraphMode.NONE)
-                            # Join offloader's copy stream after forward to avoid
-                            # unjoined stream error. The last layer's start_prefetch
-                            # forks copy_stream, but wait_prefetch only happens in
-                            # the next forward pass.
                             get_offloader().join_after_forward()
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
@@ -487,7 +491,7 @@ class CudaGraphManager:
                             self._capture_mem_samples.append(free_before - free_after)
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
-
+                        logger.debug("Captured FULL cudagraph %s", desc)
         self._graphs_captured = True
 
     def captured_token_counts(self) -> list[int]:
@@ -623,15 +627,22 @@ class ModelCudaGraphManager(CudaGraphManager):
                 else:
                     hidden_states = model_output
                     aux_hidden_states = []
-                if self.hidden_states is None:
+                # The model output can be wider than the first captured batch
+                # (FULL + PIECEWISE share this buffer); grow it instead of
+                # writing past its end.
+                n_hs = hidden_states.shape[0]
+                if self.hidden_states is None or self.hidden_states.shape[0] < n_hs:
                     self.hidden_states = torch.empty_like(hidden_states)
-                self.hidden_states[:num_tokens] = hidden_states
+                self.hidden_states[:n_hs].copy_(hidden_states)
                 if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
                     self.aux_hidden_states = [
                         torch.empty_like(x) for x in aux_hidden_states
                     ]
                 for i, aux in enumerate(aux_hidden_states):
-                    self.aux_hidden_states[i][:num_tokens] = aux
+                    n_aux = aux.shape[0]
+                    if self.aux_hidden_states[i].shape[0] < n_aux:
+                        self.aux_hidden_states[i] = torch.empty_like(aux)
+                    self.aux_hidden_states[i][:n_aux].copy_(aux)
             else:
                 # Non-last PP rank.
                 assert isinstance(model_output, IntermediateTensors)

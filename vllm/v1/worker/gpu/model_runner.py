@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -37,6 +38,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
+from vllm.distributed.device_communicators.rdna_all_reduce import rdna_ar_check
 from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -57,6 +59,7 @@ from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rdna import on_rdna_family
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
@@ -73,6 +76,7 @@ from vllm.v1.outputs import (
     ECConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -134,6 +138,7 @@ from vllm.v1.worker.gpu.lora_utils import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.phase_timer import phase_timer, sync_debug
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
@@ -179,6 +184,39 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+# --- DEBUG: per-step phase timing (gated by DBG_VLLM_STEP_TIMING=1) ---
+_DBG_STEP_TIMING = os.environ.get("DBG_VLLM_STEP_TIMING") == "1"
+_dbg_phase_ns: dict[str, float] = {}
+
+
+class _DbgPhase:
+    __slots__ = ("_name", "_t0")
+
+    def __init__(self, name: str):
+        self._name = name
+        self._t0 = 0.0
+
+    def __enter__(self):
+        if _DBG_STEP_TIMING:
+            self._t0 = time.perf_counter_ns()
+        return self
+
+    def __exit__(self, *args):
+        if _DBG_STEP_TIMING:
+            dt = time.perf_counter_ns() - self._t0
+            _dbg_phase_ns[self._name] = _dbg_phase_ns.get(self._name, 0) + dt
+
+
+def _dbg_flush_step(rank: int, step: int) -> None:
+    if not _DBG_STEP_TIMING or not _dbg_phase_ns:
+        return
+    parts = " ".join(f"{p}={v / 1e3:.1f}us" for p, v in _dbg_phase_ns.items())
+    logger.info("[STEP_TIMING rank=%d step=%d] %s", rank, step, parts)
+    _dbg_phase_ns.clear()
+
+
+_dbg_step_count = 0
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -341,6 +379,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._ple_offload_connector: PleOffloadConnector | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -363,6 +402,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # on the last PP rank.
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
+
+    def _setup_ple_offload(self, ipc_addr: str) -> None:
+        """Initialize PLE offload after the model state is available."""
+        # PLE placeholders are created by model loading, so CUDA output
+        # registration cannot happen in the runner constructor.
+        query_start_loc_source = getattr(self.model_state, "ple_query_start_loc", None)
+        ngram_context_source = getattr(self.model_state, "ngram_context", None)
+        if not isinstance(query_start_loc_source, torch.Tensor):
+            raise RuntimeError("PLE offload requires a query_start_loc source")
+        if not isinstance(ngram_context_source, torch.Tensor):
+            raise RuntimeError("PLE offload requires an ngram_context source")
+        self._ple_offload_connector = PleOffloadConnector(
+            self.vllm_config,
+            self.model,
+            self.device,
+            ipc_addr,
+            input_ids_source=self.input_buffers.input_ids,
+            query_start_loc_source=query_start_loc_source,
+            ngram_context_source=ngram_context_source,
+        )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
@@ -585,6 +644,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        if hasattr(self.model_state, "set_kv_cache_config"):
+            self.model_state.set_kv_cache_config(kv_cache_config)
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -1038,6 +1099,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
+            # Decoder capture calls the model outside execute_model. Keep dummy
+            # PLE outputs signaled until every graph has captured its semaphore
+            # wait.
+            if self._ple_offload_connector is not None and capture_decoder:
+                self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
             with self.maybe_setup_dummy_loras(self.lora_config):
                 if capture_encoder:
                     self.model_state.encoder_runner.capture()
@@ -1079,6 +1145,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Lock workspace to prevent resizing during execution. A resize after
             # capture frees the static cuda graph buffer.
             lock_workspace()
+
+        if self._ple_offload_connector is not None and capture_decoder:
+            self._ple_offload_connector.release_outputs()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
@@ -1221,12 +1290,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
+            if os.environ.get("VLLM_BT_DEBUG", "0") == "1":
+                logger.warning(
+                    "[zero-debug] zero=%s", scheduler_output.new_block_ids_to_zero
+                )
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
+            if os.environ.get("VLLM_BT_DEBUG", "0") == "1":
+                logger.warning(
+                    "[cow-debug] copies=%s zero=%s",
+                    scheduler_output.kv_cache_block_copies,
+                    scheduler_output.new_block_ids_to_zero,
+                )
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
@@ -1576,7 +1655,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
+            if phase_timer is not None:
+                phase_timer.mark("pre_logits")
             logits = self.model.compute_logits(sample_hidden_states)
+        if phase_timer is not None:
+            phase_timer.mark("logits")
 
         # A diffusion prefill has no logit rows even when a bitmask row
         # arrived for it.
@@ -1684,6 +1767,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # T44b (gfx1030): a oneshot all-reduce that hit its spin cap in the
+        # previous step already returned garbage; read the host-mapped record
+        # (no sync) and fail loudly. No-op unless VLLM_RDNA_AR=1 is active.
+        # Ported from leapdragon/vllm-rdna2-qwen T44b (Aron Hsiao).
+        rdna_ar_check()
+        if phase_timer is not None and not dummy_run:
+            phase_timer.begin_step()
+        if sync_debug is not None and not dummy_run:
+            sync_debug.begin()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1774,12 +1866,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
             # boundary reset is visible to the attention metadata.
-            self.model_state.preprocess_state(
-                input_batch,
-                block_tables,
-                self.kv_cache_config,
-                self.req_states.num_computed_tokens.gpu,
-            )
+            # Pass the SOURCE per-request-slot block tables, not the per-step
+            # gathered views: the mamba spec-decode context captures these
+            # tensors' raw data_ptrs exactly once and its copy kernels index rows
+            # by req_idx (mamba_utils.py). Gathered views are batch-ordered and
+            # re-gathered every step, so under PP a deferred postprocess on a
+            # non-last rank would walk another step's batch mapping through
+            # freed/reallocated block ids. (Port of vllm-project/vllm#55506.)
+            with _DbgPhase("preprocess"):
+                self.model_state.preprocess_state(
+                    input_batch,
+                    tuple(bt.gpu for bt in self.block_tables.block_tables),
+                    self.kv_cache_config,
+                    self.req_states.num_computed_tokens.gpu,
+                )
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1948,6 +2048,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
+        _dbg_forward_t0 = time.perf_counter_ns() if _DBG_STEP_TIMING else 0.0
+        if phase_timer is not None and not dummy_run:
+            phase_timer.start(input_batch.num_tokens)
 
         connector_kwargs = dict(
             scheduler_output=scheduler_output,
@@ -1956,8 +2059,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
+        # prepare_inputs has finalized GPU buffers. Record readiness so
+        # the request thread can stage them before the PLE placeholder runs.
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.prepare_forward(
+                input_batch.num_reqs,
+                input_batch.num_tokens_after_padding,
+                dummy_run,
+            )
+
+        # RDNA: FULL replay keeps the forward context set so GDN metadata
+        # copies (persistent decode buffers) and eager-break ops see the
+        # current batch.
+        runtime_mode = batch_desc.cg_mode
+
         # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if runtime_mode == CUDAGraphMode.FULL and not on_rdna_family():
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
@@ -1978,7 +2095,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
+                cudagraph_runtime_mode=runtime_mode,
                 num_tokens_across_dp=(
                     dp_sync.num_tokens_across_dp if dp_sync is not None else None
                 ),
@@ -1988,23 +2105,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
             ):
-                self.kv_connector.pre_forward(**connector_kwargs)
-                if ubatch_state is not None:
-                    assert self.ubatch_runner is not None
-                    model_output = self.ubatch_runner.run(
-                        self.model, model_inputs, ubatch_state
-                    )
-                elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
+                if runtime_mode == CUDAGraphMode.FULL:
+                    # RDNA FULL replay inside the forward context.
                     assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
+                    self.kv_connector.pre_forward(
+                        **connector_kwargs, attn_metadata=attn_metadata
                     )
+                    model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
                 else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    self.kv_connector.pre_forward(**connector_kwargs)
+                    if ubatch_state is not None:
+                        assert self.ubatch_runner is not None
+                        model_output = self.ubatch_runner.run(
+                            self.model, model_inputs, ubatch_state
+                        )
+                    elif runtime_mode == CUDAGraphMode.PIECEWISE:
+                        # Run the PIECEWISE graph (compiled PW cudagraph or
+                        # breakable cudagraph, chosen inside run_pw_graph).
+                        # cg_mode is only PIECEWISE after the cudagraph manager
+                        # exists.
+                        assert self.cudagraph_manager is not None
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
+                    else:
+                        # Eager (NONE): call the raw model directly.
+                        model_output = self.model(**model_inputs)
+
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.release_outputs()
 
         self.kv_connector.finish_forward()
 
@@ -2022,6 +2151,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states = None
             aux_hidden_states = None
             output_intermediate_tensors = model_output
+
+        if _DBG_STEP_TIMING:
+            _dbg_phase_ns["forward"] = _dbg_phase_ns.get("forward", 0) + (
+                time.perf_counter_ns() - _dbg_forward_t0
+            )
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("forward")
+        if sync_debug is not None and not dummy_run:
+            sync_debug.end(input_batch.num_tokens)
 
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
@@ -2050,6 +2188,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
+        global _dbg_step_count
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
@@ -2083,6 +2222,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             # The first PP rank holds the encoder cache, so pass its EC output on.
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            if _DBG_STEP_TIMING:
+                global _dbg_step_count
+                _dbg_step_count += 1
+                _dbg_flush_step(os.getpid(), _dbg_step_count)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
@@ -2096,6 +2239,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if phase_timer is not None:
+            phase_timer.mark("sample")
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2222,6 +2367,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
+        if phase_timer is not None:
+            phase_timer.end("draft")
+
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
@@ -2239,6 +2387,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
+        if _DBG_STEP_TIMING:
+            _dbg_step_count += 1
+            _dbg_flush_step(os.getpid(), _dbg_step_count)
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2263,6 +2414,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            if _DBG_STEP_TIMING:
+                global _dbg_step_count
+                _dbg_step_count += 1
+                _dbg_flush_step(os.getpid(), _dbg_step_count)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         assert self.pooling_runner is not None
@@ -2299,6 +2454,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.close()
+            self._ple_offload_connector = None
         torch.accelerator.synchronize()
         if self.aux_output_connector is not None:
             self.aux_output_connector.close()

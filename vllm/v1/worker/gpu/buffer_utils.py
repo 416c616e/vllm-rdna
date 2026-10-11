@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.platforms.rdna import on_rdna_family
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
@@ -19,6 +20,9 @@ logger = init_logger(__name__)
 # Default round-robin depth for the UVA buffer pools. Must be >= the number of
 # concurrent in-flight steps (engine batch_queue_size).
 _DEFAULT_MAX_CONCURRENCY = 2
+
+
+_ON_RDNA = on_rdna_family()
 
 
 def set_default_max_concurrency(n: int) -> None:
@@ -174,6 +178,19 @@ class StagedWriteTensor:
         self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_contents = new_buffer(1, dtype=dtype) if uva_instead_of_gpu else None
 
+        # GPU mirrors for cudagraph-safe staging: UVA buffers expose pinned
+        # host VAs to the GPU, and a captured graph that reads them faults on
+        # replay when the host page is migrated or unmapped.
+        self._gpu_write_indices = torch.zeros(
+            self.num_rows, dtype=torch.int32, device=device
+        )
+        self._gpu_write_starts = torch.zeros(
+            self.num_rows, dtype=torch.int32, device=device
+        )
+        self._gpu_write_cu_lens = torch.zeros(
+            self.num_rows, dtype=torch.int32, device=device
+        )
+
     def stage_write(
         self, index: int, start: int, x: Iterable[int] | Iterable[float]
     ) -> None:
@@ -198,11 +215,34 @@ class StagedWriteTensor:
         if n == 0:
             return
 
-        indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
-        starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
-        cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
+        # RDNA: never bake a UVA (pinned host) pointer into a captured graph;
+        # the host page can be migrated or unmapped before replay.
+        capturing = _ON_RDNA and torch.cuda.is_current_stream_capturing()
+        if capturing:
+            indices_ptr = self._gpu_write_indices[:n]
+            starts_ptr = self._gpu_write_starts[:n]
+            cu_lens_ptr = self._gpu_write_cu_lens[:n]
+            indices_ptr.copy_(
+                torch.tensor(
+                    self._staged_write_indices, dtype=torch.int32, device=self.device
+                )
+            )
+            starts_ptr.copy_(
+                torch.tensor(
+                    self._staged_write_starts, dtype=torch.int32, device=self.device
+                )
+            )
+            cu_lens_ptr.copy_(
+                torch.tensor(
+                    self._staged_write_cu_lens, dtype=torch.int32, device=self.device
+                )
+            )
+        else:
+            indices_ptr = self.write_indices.copy_to_uva(self._staged_write_indices)
+            starts_ptr = self.write_starts.copy_to_uva(self._staged_write_starts)
+            cu_lens_ptr = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
 
-        if self.write_contents is None:
+        if self.write_contents is None or capturing:
             write_contents = async_tensor_h2d(
                 self._staged_write_contents, device=self.device, dtype=self.dtype
             )
@@ -211,19 +251,17 @@ class StagedWriteTensor:
                 self._staged_write_contents
             )
 
-        # Write diffs to the GPU buffer
         _apply_write_kernel[(n,)](
             self.gpu,
             self.gpu.stride(0),
-            indices_uva,
-            starts_uva,
+            indices_ptr,
+            starts_ptr,
             write_contents,
-            cu_lens_uva,
+            cu_lens_ptr,
             None,
             BLOCK_SIZE=1024,
             MULTI_GROUP=False,
         )
-        # Clear the staged writes
         self.clear_staged_writes()
 
     def clear_staged_writes(self) -> None:
@@ -247,6 +285,11 @@ class FusedStagedWriter:
         self.starts = new_pool(max_writes)
         self.cu_lens = new_pool(max_writes)
         self.device = device
+
+        self._gpu_group_ids = torch.zeros(max_writes, dtype=torch.int32, device=device)
+        self._gpu_indices = torch.zeros(max_writes, dtype=torch.int32, device=device)
+        self._gpu_starts = torch.zeros(max_writes, dtype=torch.int32, device=device)
+        self._gpu_cu_lens = torch.zeros(max_writes, dtype=torch.int32, device=device)
 
     def apply(
         self,
@@ -276,20 +319,40 @@ class FusedStagedWriter:
         if not group_ids:
             return
 
-        group_ids_uva = self.group_ids.copy_to_uva(group_ids)
-        indices_uva = self.indices.copy_to_uva(indices)
-        starts_uva = self.starts.copy_to_uva(starts)
-        cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
+        n = len(group_ids)
+        capturing = _ON_RDNA and torch.cuda.is_current_stream_capturing()
+        if capturing:
+            group_ids_ptr = self._gpu_group_ids[:n]
+            indices_ptr = self._gpu_indices[:n]
+            starts_ptr = self._gpu_starts[:n]
+            cu_lens_ptr = self._gpu_cu_lens[:n]
+            group_ids_ptr.copy_(
+                torch.tensor(group_ids, dtype=torch.int32, device=self.device)
+            )
+            indices_ptr.copy_(
+                torch.tensor(indices, dtype=torch.int32, device=self.device)
+            )
+            starts_ptr.copy_(
+                torch.tensor(starts, dtype=torch.int32, device=self.device)
+            )
+            cu_lens_ptr.copy_(
+                torch.tensor(cu_lens, dtype=torch.int32, device=self.device)
+            )
+        else:
+            group_ids_ptr = self.group_ids.copy_to_uva(group_ids)
+            indices_ptr = self.indices.copy_to_uva(indices)
+            starts_ptr = self.starts.copy_to_uva(starts)
+            cu_lens_ptr = self.cu_lens.copy_to_uva(cu_lens)
         contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
 
-        _apply_write_kernel[(len(group_ids),)](
+        _apply_write_kernel[(n,)](
             output_ptrs,
             output_strides,
-            indices_uva,
-            starts_uva,
+            indices_ptr,
+            starts_ptr,
             contents_gpu,
-            cu_lens_uva,
-            group_ids_uva,
+            cu_lens_ptr,
+            group_ids_ptr,
             BLOCK_SIZE=1024,
             MULTI_GROUP=True,
         )

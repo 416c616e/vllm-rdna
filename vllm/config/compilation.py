@@ -769,10 +769,13 @@ class CompilationConfig:
         "vllm::short_conv",
         # Qwen4Exp's AMD backend still uses these splitting ops.
         "vllm::qwen4_exp_ple_short_conv",
+        # RDNA only: PLE n-gram embedding kept out of the captured pieces.
+        "vllm::qwen4_exp_amd_ple_embedding_rdna",
         "vllm::qwen4_exp_qsa_with_output",
         "vllm::linear_attention",
         "vllm::qwen_gdn_attention_core",
         "vllm::qwen_gdn_attention_core_fused_norm_packed",
+        "vllm::qwen_gdn_full_forward",
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",
         "vllm::sparse_attn_indexer",

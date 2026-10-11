@@ -46,6 +46,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.platforms.rdna import on_rdna_family
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -95,24 +96,31 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    if not is_breakable_cudagraph_enabled():
+    rdna = on_rdna_family()
+    if not is_breakable_cudagraph_enabled() and not rdna:
         return fn
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         capture = BreakableCUDAGraphCapture.current()
-        if capture is None:
+        if capture is None or not capture._capturing:
             return fn(*args, **kwargs)
-        if not capture._capturing:
-            return fn(*args, **kwargs)
+        # FULL capture on CUDA still wants attention inside the graph.
+        # HIP FULL capture uses BreakableCUDAGraphCapture (see
+        # cudagraph_utils) and must break GDN/FA out — Triton scratch
+        # and GDN state indices do not replay.
         if is_forward_context_available():
             mode = get_forward_context().cudagraph_runtime_mode
-            if mode == CUDAGraphMode.FULL:
+            if mode == CUDAGraphMode.FULL and not rdna:
                 return fn(*args, **kwargs)
 
-        # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool
-        # slots across batch descriptors. cudagraph owns the slot, so the
-        # weak_ref is safe to deref on replay.
+        # Weak-ref args so replay lambdas do not pin graph-pool slots across
+        # batch descriptors. RDNA: keep strong refs -- inductor temps backing
+        # GDN/FA inputs are not always graph-pool owned, and weak refs dangle
+        # into capture-time dummy activations (27B AWQ TP=2 `full.env` decoded
+        # " is is is" after a correct prefill with weak refs).
+        if rdna:
+            return capture.add_eager(functools.partial(fn, *args, **kwargs))
         weak_args = tuple(_weak_ref_capture_arg(a) for a in args)
         weak_kwargs = {k: _weak_ref_capture_arg(v) for k, v in kwargs.items()}
         return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
@@ -149,6 +157,16 @@ class BreakableCUDAGraphCapture:
     @classmethod
     def is_active(cls) -> bool:
         return cls.current() is not None
+
+    @property
+    def capturing_segment(self) -> bool:
+        """True only inside a graph segment, False during an eager break.
+
+        ``hipStreamIsCapturing`` is unreliable on gfx1030 (false positives
+        during eager breaks and replay), so callers that must distinguish
+        "captured" from "eager break" should ask this instead.
+        """
+        return self._capturing
 
     def __init__(self, pool: Any | None = None) -> None:
         self.pool = pool

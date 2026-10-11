@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm.config import ModelConfig
 from vllm.model_executor.models.interfaces import SupportsMRoPE
+from vllm.platforms.rdna import on_rdna_family
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
@@ -52,6 +53,14 @@ class RopeState:
         self.positions = torch.zeros(
             (num_dims, max_num_tokens + 1), dtype=torch.int64, device=device
         )
+        # Packed (D, N) workspace: dummy extra column on `positions` keeps
+        # Dynamo from specializing stride==N; inductor still needs
+        # contiguous stride (N, 1). One allocation, prefix view per N.
+        self._packed_positions = (
+            torch.empty(num_dims * max_num_tokens, dtype=torch.int64, device=device)
+            if on_rdna_family()
+            else None
+        )
 
         self.prefill_delta = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
 
@@ -77,7 +86,15 @@ class RopeState:
         self.prefill_delta.copy_to_uva()
 
     def get_positions(self, num_tokens: int) -> torch.Tensor:
-        return self.positions[:, :num_tokens]
+        if self._packed_positions is None:
+            return self.positions[:, :num_tokens]
+        if num_tokens <= 0:
+            return self._packed_positions[:0].view(self.num_dims, 0)
+        dst = self._packed_positions[: self.num_dims * num_tokens].view(
+            self.num_dims, num_tokens
+        )
+        dst.copy_(self.positions[:, :num_tokens])
+        return dst
 
     def read_prefill_positions(self, req_idx: int, length: int) -> torch.Tensor:
         """Return staged per-request prefill positions as [num_dims, length]."""
