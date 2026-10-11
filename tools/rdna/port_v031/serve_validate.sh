@@ -13,6 +13,10 @@
 # CELLS=none skips the bench cells. WARMUP=0 skips the capture-ladder warm-up
 # (tools/rdna/port_v031/ladder_warmup.py) that runs before the stall probe.
 #
+# LOAD_HOOK=/path/script.sh runs after the bench cells (before the after-load
+# probe) with URL, PORT, SERVED, MODEL and OUT exported, e.g. a real-traffic
+# workload; its output goes to $OUT/load_hook.txt and must end in PASS/FAIL.
+#
 # STALL_PROBE=1 (default 0) runs tools/rdna/port_v031/stall_probe.py (mixed
 # prefill/decode stall probe, docs/rdna2/mixed-batch-stall-probe.md) after the
 # probes, with STALL_ARGS passed through (gates, lengths, repeats). It also
@@ -190,6 +194,13 @@ for cell in $CELLS; do
         break
     fi
 done
+if [[ -n ${LOAD_HOOK:-} ]] && kill -0 "$SPID" 2>/dev/null; then
+    log "load hook: $LOAD_HOOK"
+    URL=$URL PORT=$PORT SERVED=$SERVED MODEL=$MODEL OUT=$OUT \
+        bash "$LOAD_HOOK" > "$OUT/load_hook.txt" 2>&1
+    log "LOAD HOOK rc=$? $(grep -aoE "(PASS|FAIL)[^\n]*" "$OUT/load_hook.txt" | tail -1)"
+    grep -aE "^\[|PASS|FAIL|garbage" "$OUT/load_hook.txt" | tail -12 | sed 's/^/    /' | tee -a "$SUM"
+fi
 # One more probe after load: corruption under load shows up here.
 if "$VENV/bin/python" "$TREE/tools/probe_greedy_correctness.py" --url "$URL" \
     --model "$SERVED" --max-tokens 48 > "$OUT/probe-after.txt" 2>&1; then

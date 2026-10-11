@@ -28,6 +28,9 @@ from vllm.models.qwen4_exp.amd import ple_layer as amd_ple_layer
 from vllm.models.qwen4_exp.amd.ple_layer import (
     Qwen4ExpPLELayer as Qwen4ExpPLELayerAMD,
 )
+from vllm.models.qwen4_exp.common.ngram_embedding import (
+    Qwen4ExpPLEInt4EmbeddingMethod,
+)
 from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
     compute_ple_shard_overlap,
@@ -417,6 +420,108 @@ def test_ple_fp8_embedding_dequantizes_in_ple_layer(monkeypatch) -> None:
     assert output.dtype == torch.bfloat16
     weight = torch.tensor([[1.0, 2.0], [4.0, 8.0], [16.0, 32.0]])
     torch.testing.assert_close(output, (weight[[2, 0]] * 0.25).bfloat16())
+
+
+def _write_int4_ple_dir(path, rows: int, width: int, shards: int):
+    """Write a ples_int4-format table; return its fp32 dequantized rows."""
+    import json
+
+    from safetensors.torch import save_file
+
+    generator = torch.Generator().manual_seed(0)
+    values = torch.randint(0, 16, (rows, width), generator=generator)
+    scale = torch.rand(rows, width // 16, generator=generator).to(torch.float16)
+    packed = (values[:, 0::2] | (values[:, 1::2] << 4)).to(torch.uint8)
+    per_shard = rows // shards
+    for n in range(shards):
+        rows_n = slice(n * per_shard, (n + 1) * per_shard)
+        save_file(
+            {"weight_i4": packed[rows_n].contiguous(), "weight_scale": scale[rows_n]},
+            str(path / f"shard_{n}.safetensors"),
+        )
+    meta = {
+        "layout": Qwen4ExpPLEInt4EmbeddingMethod.LAYOUT,
+        "shards": shards,
+        "rows": rows,
+        "width": width,
+    }
+    (path / "META.json").write_text(json.dumps(meta))
+    return (values.float() - 8.0) * scale.float().repeat_interleave(16, dim=1)
+
+
+def test_ple_int4_table_loads_from_quant_dir_and_dequantizes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    reference = _write_int4_ple_dir(tmp_path, rows=8, width=32, shards=2)
+    monkeypatch.setattr(
+        ngram_embedding_module.envs, "VLLM_PLE_QUANT_DIR", str(tmp_path)
+    )
+    method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "test.ple_embedding")
+    assert isinstance(method, Qwen4ExpPLEInt4EmbeddingMethod)
+    _mock_etp_group(monkeypatch)
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    layer = Qwen4ExpPLEDeviceEmbedding(
+        8,
+        32,
+        params_dtype=torch.float16,
+        padding_size=1,
+        prefix="test.ple_embedding",
+        embedding_method=method,
+    )
+    assert layer.weight.dtype == torch.uint8 and layer.lookup_dtype == torch.float16
+
+    method.process_weights_after_loading(layer)
+    ids = torch.tensor([7, 0, 3, 4])
+    output = layer(ids)
+
+    assert output.dtype == torch.float16
+    torch.testing.assert_close(output, reference[ids].half())
+    assert layer.dequantize(output, torch.float16) is output
+
+
+def test_ple_int4_rejects_other_table_layouts(monkeypatch, tmp_path) -> None:
+    (tmp_path / "META.json").write_text(
+        '{"layout": "per_row_e4m3", "shards": 1, "rows": 4, "width": 16}'
+    )
+    monkeypatch.setattr(
+        ngram_embedding_module.envs, "VLLM_PLE_QUANT_DIR", str(tmp_path)
+    )
+    with pytest.raises(NotImplementedError, match="ples_int4"):
+        Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "test.ple_embedding")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for UVA")
+def test_ple_int4_pinned_uva_lookup_matches_reference(tmp_path) -> None:
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    reference = _write_int4_ple_dir(tmp_path, rows=8, width=160, shards=1)
+    from safetensors.torch import load_file
+
+    shard = load_file(str(tmp_path / "shard_0.safetensors"))
+    # This rank owns rows [2, 6); ids outside it must come back as zeros.
+    packed = shard["weight_i4"][2:6].contiguous().pin_memory()
+    scale = shard["weight_scale"][2:6].contiguous().pin_memory()
+    ids = torch.tensor([5, 0, 2, 7, 3], device="cuda")
+    output = torch.empty(5, 160, dtype=torch.float16, device="cuda")
+
+    ngram_embedding_module._lookup_ple_int4_from_pinned_kernel[(5,)](
+        get_accelerator_view_from_cpu_tensor(packed),
+        get_accelerator_view_from_cpu_tensor(scale),
+        ids,
+        output,
+        160,
+        2,
+        6,
+        GROUP=16,
+        BLOCK_D=256,
+    )
+
+    expected = reference[ids.cpu()].half()
+    expected[[1, 3]] = 0
+    torch.testing.assert_close(output.cpu(), expected)
 
 
 def test_ple_fp8_embedding_rejects_missing_global_scale(monkeypatch) -> None:

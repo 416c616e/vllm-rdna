@@ -408,6 +408,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 loaded.add(name)
                 continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
+                method = getattr(self.ngram_embedding, "embedding_method", None)
+                if getattr(method, "lookup_dequantizes", False):
+                    # The table comes from VLLM_PLE_QUANT_DIR after loading.
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
                     regular_weights.append((name, loaded_weight))
