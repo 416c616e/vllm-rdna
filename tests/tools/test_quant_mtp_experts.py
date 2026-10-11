@@ -19,30 +19,35 @@ _spec.loader.exec_module(qm)
 GS = 32
 
 
-def test_pack_round_trips_exact_grid_values():
+def test_quant_matches_minmax_grid():
     torch.manual_seed(0)
     scale = torch.rand(4, 64 // GS) + 0.5
     q = torch.randint(-7, 8, (4, 64)).float()
-    # |q| <= 7 with a 7 in every group, so the RTN scale (amax / 7) is exact.
-    q[:, ::GS] = 7
+    # Every group's absmax is 7.5 * scale, on the negative side: the RTN scale
+    # (absmax / 7.5) is exact and that element rounds to q = -8.
     w = (q.reshape(4, -1, GS) * scale[..., None]).reshape(4, 64)
+    w.view(4, -1, GS)[:, :, 0] = -7.5 * scale
     packed, s = qm.quant_rtn(w, GS)
     assert packed.dtype == torch.int32 and packed.shape == (4, 8)
     assert s.dtype == torch.bfloat16 and s.shape == (4, 2)
-    torch.testing.assert_close(qm.unpack(packed, s, GS), w, rtol=1e-2, atol=1e-2)
-    # Re-quantizing the dequantized weights gives the same words.
-    assert torch.equal(qm.quant_rtn(qm.unpack(packed, s, GS), GS)[0], packed)
+    expect = q.clone()
+    expect.view(4, -1, GS)[:, :, 0] = -8
+    deq = qm.unpack(packed, s, GS)
+    exp_w = (expect.reshape(4, -1, GS) * s.float()[..., None]).reshape(4, 64)
+    torch.testing.assert_close(deq, exp_w)
 
 
 def test_nibble_order_low_bits_first():
     w = torch.zeros(1, GS)
-    w[0, 0] = 7.0  # q=7 -> nibble 15 in bits 0..3 of word 0
-    w[0, 1] = -7.0  # q=-7 -> nibble 1 in bits 4..7
+    w[0, 0] = 7.0  # 7 * 7.5 / 7 = 7.5 -> clamped to q=7 -> nibble 15
+    w[0, 1] = -7.0  # -7.5 rounds to q=-8 -> nibble 0
+    w[0, 2] = 3.5  # 3.75 -> q=4 -> nibble 12
     packed, _ = qm.quant_rtn(w, GS)
     word = int(packed[0, 0]) & 0xFFFFFFFF
     assert word & 0xF == 15
-    assert (word >> 4) & 0xF == 1
-    assert (word >> 8) & 0xF == 8  # zero -> nibble 8
+    assert (word >> 4) & 0xF == 0
+    assert (word >> 8) & 0xF == 12
+    assert (word >> 12) & 0xF == 8  # zero -> nibble 8
 
 
 def test_rejects_bad_k():

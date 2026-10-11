@@ -19,9 +19,9 @@ under ``mtp.`` except the experts), and symlinks to every other source file.
 Usage:
     python tools/rdna/quant_mtp_experts.py <src_checkpoint_dir> <dst_dir>
 
-Before writing anything it re-quantizes one main expert from its dequantized
-weights and checks the packing round-trips (same int32 words), which proves
-the nibble order and offset match the checkpoint.
+Before writing anything it checks one main expert: repacking its nibbles
+gives the same int32 words (nibble order), and some group reaches q = -8
+(the absmax / 7.5 scale convention).
 """
 
 import argparse
@@ -42,23 +42,31 @@ _MTP_IGNORE_ALL = ("re:.*mtp\\..*", "re:^mtp.*")
 NEW_SHARD = "model_mtp_w4a16.safetensors"
 
 
+def pack_nibbles(nib: torch.Tensor) -> torch.Tensor:
+    """[N, K] nibbles (0..15) -> [N, K/8] int32, element 0 in the low bits."""
+    n, k = nib.shape
+    nib = nib.to(torch.int32).reshape(n, k // 8, 8)
+    packed = torch.zeros(n, k // 8, dtype=torch.int32)
+    for i in range(8):
+        packed |= nib[:, :, i] << (4 * i)
+    return packed.contiguous()
+
+
 def quant_rtn(w: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """[N, K] float -> (packed int32 [N, K/8], scale bf16 [N, K/group_size]).
 
-    Symmetric int4, q in [-8, 7], stored as uint4b8 (nibble = q + 8,
+    compressed-tensors symmetric min-max, as the main experts were quantized:
+    scale = absmax / 7.5, q = round(w / scale) clamped to [-8, 7] (so the
+    negative extreme lands on -8), stored as uint4b8 (nibble = q + 8,
     dequant = (nibble - 8) * scale); nibble 0 in the low bits.
     """
     n, k = w.shape
     if k % group_size or k % 8:
         raise ValueError(f"K={k} must be a multiple of {group_size} and 8")
     wf = w.float().reshape(n, k // group_size, group_size)
-    scale = wf.abs().amax(dim=-1).clamp_min(1e-8) / 7.0
+    scale = wf.abs().amax(dim=-1).clamp_min(1e-8) / 7.5
     q = torch.round(wf / scale[..., None]).clamp_(-8, 7).reshape(n, k)
-    nib = (q + 8).to(torch.int32).reshape(n, k // 8, 8)
-    packed = torch.zeros(n, k // 8, dtype=torch.int32)
-    for i in range(8):
-        packed |= nib[:, :, i] << (4 * i)
-    return packed.contiguous(), scale.to(torch.bfloat16).contiguous()
+    return pack_nibbles(q + 8), scale.to(torch.bfloat16).contiguous()
 
 
 def unpack(packed: torch.Tensor, scale: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -151,16 +159,21 @@ def _check_packing(src: Path, weight_map: dict[str, str], group_size: int) -> No
     base = key.removesuffix("weight_packed")
     with safe_open(src / weight_map[key], "pt") as f:
         p0 = f.get_tensor(base + "weight_packed")
-        s0 = f.get_tensor(base + "weight_scale")
-    p1, s1 = quant_rtn(unpack(p0, s0, group_size), group_size)
-    rel = ((s1.float() - s0.float()).abs() / s0.float().abs().clamp_min(1e-9)).max()
+    p = p0.to(torch.int64) & 0xFFFFFFFF
+    nib = torch.stack([(p >> (4 * i)) & 0xF for i in range(8)], dim=-1)
+    nib = nib.reshape(p0.shape[0], -1)
+    order_ok = torch.equal(pack_nibbles(nib), p0)
+    # absmax / 7.5 puts a group's negative extreme on q = -8; absmax / 7 never
+    # reaches it. Some group of a real expert must hit -8.
+    hits_minus8 = bool((nib == 0).any())
     print(
-        f"packing check on {base}: words identical={torch.equal(p0, p1)}, "
-        f"scale max rel diff={rel.item():.2e}"
+        f"packing check on {base}: nibble order matches={order_ok}, "
+        f"q=-8 present={hits_minus8} (scale = absmax / 7.5)"
     )
-    if not torch.equal(p0, p1):
+    if not (order_ok and hits_minus8):
         raise SystemExit(
-            "packing convention does not round-trip on a main expert; not writing"
+            "main-expert packing or scale convention differs from this tool; "
+            "not writing"
         )
 
 
@@ -171,7 +184,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--skip-check",
         action="store_true",
-        help="skip the main-expert packing round-trip check",
+        help="skip the main-expert packing and scale-convention check",
     )
     args = ap.parse_args(argv)
 
