@@ -291,11 +291,6 @@ class Worker(WorkerBase):
         if self.vllm_config.weight_transfer_config is not None:
             unsupported.append("weight transfer")
 
-        # v0.31 port: Qwen4Exp's PLE layer now follows upstream (pinned-host
-        # UVA offload via EngramConfig.cpu_offload) and no longer inherits
-        # PleOffloadLayer, so the sidecar cannot attach to it yet.
-        unsupported.append("Qwen4Exp PLE sidecar not re-wired on the v0.31 port")
-
         if unsupported:
             raise ValueError(
                 "VLLM_PLE_CPU_OFFLOAD does not support the requested "

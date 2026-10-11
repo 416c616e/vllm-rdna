@@ -166,6 +166,14 @@ def _ple_offload_wait_impl(
     hidden_states: torch.Tensor,
 ) -> None:
     """Wait for the CPU result without releasing its output buffer."""
+    if torch.version.hip is not None:
+        # ROCm: the connector already waits on the host for the CPU result and
+        # copies it on this stream before the forward (PleOffloadConnector.
+        # prepare_forward), so this device wait is redundant. hipStreamWaitValue32
+        # is not recorded into HIP graphs, and in eager steps a pending
+        # WAIT_REG_MEM packet cannot be preempted when KFD evicts queues: the
+        # stream stalls and the engine hangs (seen under the concurrency probe).
+        return
     stream = torch.cuda.current_stream()
     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
     dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())

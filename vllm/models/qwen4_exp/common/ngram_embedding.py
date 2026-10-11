@@ -185,7 +185,9 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         embedding_dtype: str | None = None,
     ) -> "Qwen4ExpPLEEmbeddingMethod":
         """Select the concrete PLE embedding format for a layer."""
-        if envs.VLLM_PLE_QUANT_DIR:
+        if envs.VLLM_PLE_QUANT_DIR and not envs.VLLM_PLE_CPU_OFFLOAD:
+            # With VLLM_PLE_CPU_OFFLOAD the sidecar serves the same directory
+            # from disk instead (vllm/v1/ple_offload).
             return Qwen4ExpPLEInt4EmbeddingMethod(envs.VLLM_PLE_QUANT_DIR)
         if embedding_dtype == "float8_e4m3fn":
             return Qwen4ExpPLEFp8EmbeddingMethod()
