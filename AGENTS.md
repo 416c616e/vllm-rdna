@@ -153,6 +153,8 @@ Security reviewers should start with [`SECURITY.md`](SECURITY.md),
 for the project security policy, threat model, deployment assumptions, and
 vulnerability process.
 
+- **RDNA serving and tuning** (fork env vars, launcher modes, TunableOp):
+  [`docs/rdna2/tuning.md`](docs/rdna2/tuning.md)
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
