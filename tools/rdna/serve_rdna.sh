@@ -210,6 +210,15 @@ fi
 if [[ -v RDNA_AR ]]; then
     export VLLM_RDNA_AR=${VLLM_RDNA_AR:-$RDNA_AR}
 fi
+# P2P=0: no PCIe peer-to-peer at all, for hosts where P2P is broken or
+# unsupported (and to bisect wrong output): the RDNA one-shot all-reduce is
+# off (overrides the recipe) and RCCL goes through host shared memory.
+P2P=${P2P:-1}
+case $P2P in
+    1) ;;
+    0) export VLLM_RDNA_AR=0 NCCL_P2P_DISABLE=1 ;;
+    *) rdna_die "P2P must be 1 or 0 (got '$P2P')." ;;
+esac
 
 case $ALLOC_CONF in
     false) export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False} ;;
@@ -369,7 +378,7 @@ RDSE_ENV_KEYS=(
     VLLM_PLE_CPU_OFFLOAD VLLM_PLE_OFFLOAD_READY_TIMEOUT VLLM_PLE_QUANT_DIR
     VLLM_EXL3_DEBUG
     VLLM_RDNA_DECODE_STALL_MS VLLM_RDNA_DECODE_SHARE VLLM_DECODE_STALL_MAX_OVERHEAD VLLM_DECODE_STALL_FIT_ALL
-    NCCL_P2P_LEVEL RCCL_P2P_NET_DISABLE RCCL_P2P_BATCH_ENABLE NCCL_PROTO
+    NCCL_P2P_LEVEL NCCL_P2P_DISABLE RCCL_P2P_NET_DISABLE RCCL_P2P_BATCH_ENABLE NCCL_PROTO
     RCCL_MSCCL_ENABLE
     HSA_FORCE_FINE_GRAIN_PCIE HSA_ENABLE_SDMA OMP_NUM_THREADS
     TOKENIZERS_PARALLELISM PYTHONFAULTHANDLER PYTORCH_CUDA_ALLOC_CONF
@@ -380,6 +389,7 @@ rdse_print_plan() {
     printf '# tunableop: %s\n' "$rdse_profile_line"
     printf '# entry:     %s\n' "$SERVE_ENTRY"
     printf '# ple:       %s%s\n' "$PLE" "${PLE_QUANT_DIR:+ ($PLE_QUANT_DIR)}"
+    printf '# p2p:       %s\n' "$([[ $P2P == 0 ]] && echo 'off (no rdna_ar, RCCL over SHM)' || echo on)"
     printf '\n# --- environment ---\n'
     for _key in "${RDSE_ENV_KEYS[@]}"; do
         if [[ -v $_key ]]; then
