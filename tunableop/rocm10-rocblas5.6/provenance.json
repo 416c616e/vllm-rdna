@@ -1,13 +1,13 @@
 {
   "profile": "rocm10-rocblas5.6",
-  "library": "<venv>/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5",
-  "sha256": "c27e2252cc7a4b6e174601a180a169822dcf15a29e634046daecb61498e3bd2a",
+  "library": "/opt/rocm/core-10.0/lib/librocblas.so.5.6",
+  "sha256": "d05939967b5f1bd184a4b8c1c77509c87a0abae3f0b3d079ba9d68ed1ddc50a5",
   "torch": "2.13.0+rocm10.0.0",
   "hip": "7.15.26333",
   "rocblas": "5.6.0.8d1ae90e",
   "rocm": "7.15.26333",
-  "rows_per_rank": 70,
-  "status": "thin, needs its own capture campaign",
+  "rows_per_rank": 44,
+  "status": "qualified for build d05939967b5f",
   "dtype": "float16",
   "seed": 620,
   "batch_tokens": [
@@ -24,5 +24,22 @@
   ],
   "source": "Adapted existing v620-probe-dense-tunable.py",
   "base_rows": "<venv>/cache-prefill-recovery-2026-09-13/qualified/rocblas-c27e2252cc7a",
-  "storage_policy": "Visible sibling profile (not archived). Registered in ../profiles.json; configure_tunableop auto-selects it only when the loaded librocblas.so.5 hashes to c27e2252cc7a, or when TUNABLEOP_PROFILE=rocm10-rocblas5.6 is set (validated against the loaded lib). Only 70 rows/rank for a build that has not been exercised on the fork's serving matrix: treat as thin and schedule its own capture campaign before relying on it."
+  "storage_policy": "Visible sibling profile (not archived). Registered in ../profiles.json; configure_tunableop auto-selects it only when the loaded librocblas.so.5 hashes to c27e2252cc7a, or when TUNABLEOP_PROFILE=rocm10-rocblas5.6 is set (validated against the loaded lib). Only 70 rows/rank for a build that has not been exercised on the fork's serving matrix: treat as thin and schedule its own capture campaign before relying on it.",
+  "imported": {
+    "from": "PR #5 (commit ca83d922a)",
+    "by": "Leapdragon/George V620 table",
+    "lib_sha256": "c27e2252cc7a4b6e174601a180a169822dcf15a29e634046daecb61498e3bd2a",
+    "rows_per_rank": 70,
+    "note": "retired build; superseded by the campaign below"
+  },
+  "campaign": {
+    "when": "2026-10-12",
+    "pipeline": "tools/rdna2_028/tunableop_rows_pipeline.sh (PHASE=all) + curate_tunableop_rows.py",
+    "method": "4 GPUs tuned in parallel (10 iters, 25 ms budget); heuristic / current / new measured in one session; curated with 3% adopt and 3% drop margins.",
+    "candidates": "current = tunableop/rocblas-d05939967b5f rows (same build); new = fresh tune on this build",
+    "decisions": "new 4, current 40, dropped 26 of 70 -> 44 rows/rank",
+    "lookup_hit_proof": "44/44 (verify_lookup_hit.sh, DEVICE=3)",
+    "measurement_note": "Same-session repeats agree to ~0.3% median (|d|>3% on 1/70). Across sessions the same row set drifts 5-10%, so adopt/drop margins are only meaningful within one session.",
+    "finding": "ours / imported / curated_v2 all measure within 0.9% of each other; all ~4% faster than the heuristic on median."
+  }
 }

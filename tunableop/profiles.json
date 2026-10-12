@@ -23,12 +23,12 @@
       "rocblas": "5.6.0.8d1ae90e",
       "rocm": "7.15.26333",
       "torch": "2.13.0+rocm10.0.0",
-      "lib_sha256": "c27e2252cc7a4b6e174601a180a169822dcf15a29e634046daecb61498e3bd2a",
-      "rows_per_rank": 70,
+      "lib_sha256": "d05939967b5f1bd184a4b8c1c77509c87a0abae3f0b3d079ba9d68ed1ddc50a5",
+      "rows_per_rank": 44,
       "venv": "v620-vllm-testing (George)",
-      "status": "thin, needs its own capture campaign",
+      "status": "qualified for build d05939967b5f",
       "covers": [
-        "imported reference table only; not exercised on the fork's serving build"
+        "Qwen3.8-Flash-Next dense projection shapes (70 TN keys, M=800..8192) on the system rocm/core-10.0 build"
       ]
     }
   }

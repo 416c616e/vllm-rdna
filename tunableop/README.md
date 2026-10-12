@@ -13,7 +13,7 @@ one visible folder per rocBLAS build, selected at launch.
 | Profile | rocBLAS | ROCm / torch | `librocblas.so.5` sha256[:12] | rows / rank | Status |
 |---|---|---|---:|---:|---|
 | `rocm7.14-rocblas5.5/` | `5.5.0.cd957402` | `7.14.60850` / `2.12.0+rocm7.14.0` | `f30bb442e9b5` | **1766** | canonical (serving build, `venv-7.14.0_0.28.0`) |
-| `rocm10-rocblas5.6/` | `5.6.0.8d1ae90e` | `7.15.26333` / `2.13.0+rocm10.0.0` | `c27e2252cc7a` | 70 | **thin, needs its own capture campaign** |
+| `rocm10-rocblas5.6/` | `5.6.0.8d1ae90e` | `7.15.26333` / `2.13.0+rocm10.0.0` | `d05939967b5f` | 44 | **qualified for build `d05939967b5f`** |
 
 The canonical profile covers all three serving families:
 
