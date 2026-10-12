@@ -51,6 +51,89 @@ from .ops.ple_conv_rdna2 import ple_conv_use_rdna2
 
 logger = init_logger(__name__)
 
+# Output columns per conv1d launch in the flat prefill short-conv; bounds the
+# per-launch temporaries independently of --max-num-batched-tokens.
+_PREFILL_CONV_BLOCK = 2048
+
+
+def short_conv_flat_prefill(
+    x_p: torch.Tensor,
+    q_starts: torch.Tensor,
+    lengths: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    weights: torch.Tensor,
+    dilation: int,
+    state_len: int,
+    num_prefills: int,
+    num_prefill_tokens: int,
+    block: int = _PREFILL_CONV_BLOCK,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Causal depthwise dilated conv + SiLU over packed prefill requests.
+
+    Requests sit back to back in one ``[hidden, tokens + P * state_len]``
+    sequence, each preceded by its ``state_len`` columns of initial state, so
+    an unpadded conv over it sees exactly each token's own causal window
+    (``state_len == (kernel - 1) * dilation``). The conv runs in ``block``
+    output columns at a time. Memory stays O(tokens * hidden) instead of the
+    padded ``P * max_len * hidden`` copies.
+
+    ``x_p``: [tokens, hidden]; ``initial_state``: [P, hidden, state_len] or
+    None when ``state_len == 0``; ``weights``: [hidden, kernel]. Returns the
+    [tokens, hidden] output and, when ``state_len > 0``, each request's last
+    ``state_len`` columns of history as [P, hidden, state_len].
+    """
+    hidden = x_p.shape[1]
+    device = x_p.device
+    positions = torch.arange(num_prefill_tokens, device=device, dtype=torch.int64)
+    req = torch.searchsorted(q_starts[1:], positions, right=True)
+    total = num_prefill_tokens + num_prefills * state_len
+
+    flat = x_p.new_empty((hidden, total))
+    flat.index_copy_(1, positions + (req + 1) * state_len, x_p.t())
+    seg_starts = None
+    if state_len > 0:
+        seg_starts = (
+            q_starts[:-1]
+            + torch.arange(num_prefills, device=device, dtype=torch.int64) * state_len
+        )
+        state_cols = seg_starts.view(-1, 1) + torch.arange(
+            state_len, device=device, dtype=torch.int64
+        ).view(1, -1)
+        flat.index_copy_(
+            1,
+            state_cols.reshape(-1),
+            initial_state.to(x_p.dtype).permute(1, 0, 2).reshape(hidden, -1),
+        )
+
+    next_state = None
+    if state_len > 0:
+        cols = (
+            seg_starts.view(-1, 1)
+            + lengths.view(-1, 1)
+            + torch.arange(state_len, device=device, dtype=torch.int64).view(1, -1)
+        )
+        next_state = (
+            flat[:, cols.reshape(-1)]
+            .view(hidden, num_prefills, state_len)
+            .permute(1, 0, 2)
+        )
+
+    out_cols = total - state_len
+    conv_out = x_p.new_empty((hidden, out_cols))
+    w = weights.unsqueeze(1).contiguous()
+    for o0 in range(0, out_cols, block):
+        o1 = min(o0 + block, out_cols)
+        y = F.conv1d(
+            flat[:, o0 : o1 + state_len].unsqueeze(0),
+            w,
+            groups=hidden,
+            dilation=dilation,
+        )[0]
+        conv_out[:, o0:o1] = F.silu(y)
+    del flat
+    output = conv_out.t().index_select(0, positions + req * state_len)
+    return output, next_state
+
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
     def __init__(
@@ -965,16 +1048,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             return output
 
         hidden_size = x_p.shape[1]
-        positions = torch.arange(
-            num_prefill_tokens, device=x_p.device, dtype=torch.int64
-        )
-        req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
-        col_indices = positions - q_starts[req_indices]
-
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
-
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
         )
@@ -985,6 +1058,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         has_initial = has_initial_states_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.bool
         )
+        initial_state = None
         if self.conv_state_len > 0:
             if conv_state.shape[0] == 0:
                 state = conv_state.new_zeros(
@@ -1001,37 +1075,27 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 state,
                 torch.zeros_like(state),
             )
-            history = torch.cat((initial_state, packed_tokens), dim=-1)
-        else:
-            history = packed_tokens
 
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
+        output, next_state = short_conv_flat_prefill(
+            x_p,
+            q_starts,
+            lengths,
+            initial_state,
+            conv_weights,
+            self.short_conv_dilation,
+            self.conv_state_len,
+            num_prefills,
+            num_prefill_tokens,
         )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
-
-        token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
-        valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
-        valid_output_mask = valid_tokens & valid_state.to(device=x_p.device).view(
-            num_prefills, 1
+        # Requests without a valid state slot produce zeros, as before.
+        positions = torch.arange(
+            num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
-        conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
+        req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
+        token_valid = valid_state.to(device=x_p.device)[req_indices]
+        output.masked_fill_(~token_valid.unsqueeze(-1), 0)
 
         if self.conv_state_len > 0 and conv_state.shape[0] > 0:
-            state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
-                num_prefills, 1, 1
-            )
-            state_offsets = torch.arange(
-                self.conv_state_len, device=history.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
-            next_state = history.gather(
-                dim=2,
-                index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
-            )
             # Write back without a host synchronization. Valid, non-empty rows
             # receive their new state; padding and zero-length rows keep the
             # current cache value.
