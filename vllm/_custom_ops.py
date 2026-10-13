@@ -1041,6 +1041,7 @@ def moe_gptq_gemm_rdna2(
     mul_topk_weight: bool,
     output_topk: int = 0,
     fp32_accum: bool | None = None,
+    use_v2_format: bool = False,
 ) -> None:
     # Schema dispatch in torch 2.12 enforces ScalarType::Float on the
     # unannotated Tensor argument for `topk_weights` (it is the only
@@ -1066,6 +1067,7 @@ def moe_gptq_gemm_rdna2(
         mul_topk_weight,
         output_topk,
         fp32_accum,
+        use_v2_format,
     )
 
 
@@ -1087,6 +1089,7 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_r
         mul_topk_weight: bool,
         output_topk: int = 0,
         fp32_accum: bool = True,
+        use_v2_format: bool = False,
     ) -> None:
         return
 

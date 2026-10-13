@@ -8,7 +8,8 @@ handles expert routing + W4A16 dequant + dot product with atomic output.
 Weight format (per expert, same as dense RDNA2 W4A16):
   - Packed int32 ``[E, K/8, N]`` with exllama shuffle
   - Scales ``[E, groups, N]`` in activation dtype
-  - Zero points ``[E, groups, N/8]`` packed int32 (synthesized)
+  - Zero points ``[E, groups, N/8]`` packed int32: synthesized for symmetric
+    checkpoints, the checkpoint's own for asymmetric ones (raw, v2 format)
 """
 
 import torch
@@ -71,19 +72,22 @@ class CompressedTensorsWNA16RDNA2MoEMethod(CompressedTensorsWNA16MoEMethod):
         # packed [E, N, K/8], scales [E, N, groups]. The RDNA2 kernel reads
         # K-first ([E, K/8, N], [E, groups, N]); int4 packing runs along K,
         # so a transpose restores the old is_transposed=True layout.
-        for name in (
+        names = [
             "w13_weight_packed",
             "w2_weight_packed",
             "w13_weight_scale",
             "w2_weight_scale",
-        ):
+        ]
+        if not self.symmetric:
+            names += ["w13_weight_zero_point", "w2_weight_zero_point"]
+        for name in names:
             replace_parameter(
                 layer, name, getattr(layer, name).data.transpose(1, 2).contiguous()
             )
         self.process_k_first_weights(layer)
 
     def process_k_first_weights(self, layer: torch.nn.Module) -> None:
-        """Shuffle, synthesize zeros and allocate buffers for K-first weights.
+        """Shuffle, set up zeros and allocate buffers for K-first weights.
 
         Also the entry point for callers that already hold K-first weights
         (the resident layout in rdna2_moe_resident.py).
@@ -111,22 +115,34 @@ class CompressedTensorsWNA16RDNA2MoEMethod(CompressedTensorsWNA16MoEMethod):
             requires_grad=False,
         )
 
-        # Synthesize packed zero points: [E, groups, N/8] int32
         w13_groups = (layer.w13_weight_packed.shape[1] * 8) // self.group_size
         w13_N = layer.w13_weight_packed.shape[2]
         w2_groups = (layer.w2_weight_packed.shape[1] * 8) // self.group_size
         w2_N = layer.w2_weight_packed.shape[2]
 
-        w13_qz = _synthesize_qzeros(w13_groups, w13_N, device)
-        w2_qz = _synthesize_qzeros(w2_groups, w2_N, device)
-        layer.w13_qzeros = torch.nn.Parameter(
-            w13_qz.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
-            requires_grad=False,
-        )
-        layer.w2_qzeros = torch.nn.Parameter(
-            w2_qz.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
-            requires_grad=False,
-        )
+        # Packed zero points [E, groups, N/8] int32. Asymmetric checkpoints keep
+        # their own (raw, read with zero_offset 0); the resident layouts build
+        # this method without __init__ and are symmetric.
+        self._zero_v2 = not getattr(self, "symmetric", True)
+        if self._zero_v2:
+            layer.w13_qzeros = torch.nn.Parameter(
+                layer.w13_weight_zero_point.data, requires_grad=False
+            )
+            layer.w2_qzeros = torch.nn.Parameter(
+                layer.w2_weight_zero_point.data, requires_grad=False
+            )
+            del layer.w13_weight_zero_point, layer.w2_weight_zero_point
+        else:
+            w13_qz = _synthesize_qzeros(w13_groups, w13_N, device)
+            w2_qz = _synthesize_qzeros(w2_groups, w2_N, device)
+            layer.w13_qzeros = torch.nn.Parameter(
+                w13_qz.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
+                requires_grad=False,
+            )
+            layer.w2_qzeros = torch.nn.Parameter(
+                w2_qz.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
+                requires_grad=False,
+            )
 
         # Pre-allocate reusable buffers for decode (sizes based on top_k=8)
         N_gate_up = w13_N
@@ -180,6 +196,7 @@ class CompressedTensorsWNA16RDNA2MoEMethod(CompressedTensorsWNA16MoEMethod):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             w4a8=getattr(self, "_w4a8", False),
+            zero_v2=getattr(self, "_zero_v2", False),
         )
 
 
@@ -193,6 +210,7 @@ def _rdna2_fused_moe(
     global_num_experts: int,
     expert_map: torch.Tensor | None,
     w4a8: bool = False,
+    zero_v2: bool = False,
 ) -> torch.Tensor:
     """Fused MoE forward using the RDNA2 W4A16 HIP kernel.
 
@@ -283,7 +301,7 @@ def _rdna2_fused_moe(
             block_size_m,
             apply_router_weight_on_input,
             0,
-            False,
+            zero_v2,
         )
     else:
         ops.moe_gptq_gemm_rdna2(
@@ -299,6 +317,7 @@ def _rdna2_fused_moe(
             top_k,
             block_size_m,
             apply_router_weight_on_input,
+            use_v2_format=zero_v2,
         )
 
     # --- Activation (silu_and_mul etc.) ---
@@ -329,7 +348,7 @@ def _rdna2_fused_moe(
             block_size_m,
             not apply_router_weight_on_input,
             output_topk=top_k,
-            use_v2_format=False,
+            use_v2_format=zero_v2,
         )
     else:
         ops.moe_gptq_gemm_rdna2(
@@ -346,5 +365,6 @@ def _rdna2_fused_moe(
             block_size_m,
             not apply_router_weight_on_input,
             output_topk=top_k,
+            use_v2_format=zero_v2,
         )
     return out
