@@ -15,8 +15,11 @@ Drafter: ROCM_specialist. Sources live in
 
 **Not yet compiled; first build on V620 with ROCm 7.14 may need small fixes.**
 
-The probe's grid is 72×256 with 64 KiB of dynamic LDS per workgroup, matching
-the silicon row in the README. `run.sh` does all of the following, each
+The probe's grid is 72×256. Dynamic LDS defaults to 65536 minus the
+kernel's static LDS (`hipFuncGetAttributes`), rounded down to 16 bytes.
+`--lds` that would put static plus dynamic over 65536 exits 2
+([probe README](../../../tools/monokernel-p0-probe/README.md)). The 64 KiB
+figure in the silicon row is the per-workgroup cap, static plus dynamic. `run.sh` does all of the following, each
 probe process under `timeout -s KILL 300`:
 
 | Check | How |

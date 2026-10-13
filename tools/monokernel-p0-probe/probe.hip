@@ -36,7 +36,9 @@ namespace cg = cooperative_groups;
 struct Cfg {
   int      grid      = 72;        // one WG per CU on V620
   int      block     = 256;
-  size_t   lds_bytes = 64 * 1024; // dynamic LDS per WG
+  size_t   lds_bytes = 0;         // dynamic LDS per WG; 0 = auto (65536 - static, 16 B aligned)
+  bool     lds_user  = false;     // set when --lds is passed
+  size_t   lds_static = 0;        // max static LDS of the two flag kernels (hipFuncGetAttributes)
   int      phases    = 16;
   int      replays   = 100;
   double   wait_ms   = 2000.0;    // device-side bound per flag wait
@@ -206,12 +208,12 @@ static hipError_t enqueue(Ctx& x, hipStream_t s, bool coop) {
   return hipSuccess;
 }
 
-static void set_lds_attr() {
+static void set_lds_attr(size_t dyn) {
   // Allow >48 KiB dynamic LDS if the runtime enforces a default cap.
   (void)hipFuncSetAttribute((const void*)flag_kernel<false>,
-        hipFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+        hipFuncAttributeMaxDynamicSharedMemorySize, (int)dyn);
   (void)hipFuncSetAttribute((const void*)flag_kernel<true>,
-        hipFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+        hipFuncAttributeMaxDynamicSharedMemorySize, (int)dyn);
   (void)hipGetLastError();
 }
 
@@ -346,7 +348,7 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto nx = [&]() { if (i + 1 >= argc) { usage(); exit(2); } return argv[++i]; };
-    if (a == "--lds") x.c.lds_bytes = strtoull(nx(), 0, 0);
+    if (a == "--lds") { x.c.lds_bytes = strtoull(nx(), 0, 0); x.c.lds_user = true; }
     else if (a == "--grid") x.c.grid = atoi(nx());
     else if (a == "--phases") x.c.phases = atoi(nx());
     else if (a == "--replays") x.c.replays = atoi(nx());
@@ -376,15 +378,41 @@ int main(int argc, char** argv) {
   printf("device: %s arch=%s CUs=%d lds/blk max=%zu coopLaunch=%d wallclock=%d kHz\n",
          p.name, p.gcnArchName, cus, p.sharedMemPerBlock, coop_ok, khz);
   printf("hip runtime=%d driver=%d\n", rt, drv);
-  printf("cfg: grid=%d block=%d lds=%zu phases=%d replays=%d wait=%.0fms host=%.0fms busy=%.0fms order=%s gap=%.1fms\n",
-         x.c.grid, x.c.block, x.c.lds_bytes, x.c.phases, x.c.replays,
+  // ---- LDS budget: static (__shared__ bail etc.) + dynamic <= 64 KiB on gfx1030.
+  const size_t kLdsLimit = 65536;
+  {
+    const void* fns[2] = {(const void*)flag_kernel<false>, (const void*)flag_kernel<true>};
+    for (int i = 0; i < 2; ++i) {
+      hipFuncAttributes fa{};
+      hipError_t e = hipFuncGetAttributes(&fa, fns[i]);
+      if (e != hipSuccess) {
+        printf("ERROR: hipFuncGetAttributes(flag_kernel<%s>) failed: %s\n",
+               i ? "coop" : "plain", hipGetErrorName(e));
+        return 2;
+      }
+      if (fa.sharedSizeBytes > x.c.lds_static) x.c.lds_static = fa.sharedSizeBytes;
+    }
+  }
+  if (!x.c.lds_user) {
+    x.c.lds_bytes = (kLdsLimit - x.c.lds_static) & ~(size_t)15;
+  } else if (x.c.lds_static + x.c.lds_bytes > kLdsLimit) {
+    printf("ERROR: --lds %zu + static LDS %zu = %zu bytes exceeds the gfx1030 "
+           "per-workgroup limit of %zu. Use --lds <= %zu.\n",
+           x.c.lds_bytes, x.c.lds_static, x.c.lds_static + x.c.lds_bytes,
+           kLdsLimit, kLdsLimit - x.c.lds_static);
+    return 2;
+  }
+
+  printf("cfg: grid=%d block=%d lds static=%zu dynamic=%zu total=%zu (limit %zu) phases=%d replays=%d wait=%.0fms host=%.0fms busy=%.0fms order=%s gap=%.1fms\n",
+         x.c.grid, x.c.block, x.c.lds_static, x.c.lds_bytes,
+         x.c.lds_static + x.c.lds_bytes, kLdsLimit, x.c.phases, x.c.replays,
          x.c.wait_ms, x.c.host_ms, x.c.busy_ms,
          x.c.busy_first ? "busy-first" : "flag-first", x.c.gap_ms);
 
   CHECK(hipMalloc(&x.flags, x.c.grid * sizeof(unsigned)));
   CHECK(hipMalloc(&x.sink, x.c.grid * sizeof(unsigned)));
   CHECK(hipHostMalloc((void**)&x.err, sizeof(StickyErr), hipHostMallocCoherent));
-  set_lds_attr();
+  set_lds_attr(x.c.lds_bytes);
 
   hipStream_t a, b;
   CHECK(hipStreamCreateWithFlags(&a, hipStreamNonBlocking));
