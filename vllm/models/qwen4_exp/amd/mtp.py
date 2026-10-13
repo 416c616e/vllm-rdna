@@ -13,6 +13,7 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
     multi stream [T, hc_count*H] (fed to the next draft step).
 """
 
+import contextlib
 from collections.abc import Iterable
 
 import regex as re
@@ -164,6 +165,13 @@ def _make_draft_vllm_config(
     return draft_vllm_config
 
 
+def _off_gpu_under_pp():
+    """Build on the CPU under PP: placeholders replaced by the target's tensors."""
+    if get_pp_group().world_size > 1:
+        return torch.device("cpu")
+    return contextlib.nullcontext()
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -191,7 +199,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
 
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        # Under PP the drafter borrows the target embedding of the last stage after
+        # loading (load_eagle_model), so the placeholder stays off the GPU.
+        with _off_gpu_under_pp():
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size, self.hidden_size
+            )
         draft_vllm_config = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
@@ -382,6 +395,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
     }
 )
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts, LocalArgmaxMixin):
+    # Qwen4Exp builds embed_tokens on every PP stage, so the drafter on the last
+    # stage can share the target's copy (see maybe_share_target_embed).
+    share_target_embed_under_pp = True
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -417,11 +433,14 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts, LocalArgmaxMi
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    prefix=maybe_prefix(prefix, "lm_head"),
-                )
+                # Shared with the target lm_head after loading; under PP keep the
+                # placeholder off the GPU so the last stage never holds two copies.
+                with _off_gpu_under_pp():
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        prefix=maybe_prefix(prefix, "lm_head"),
+                    )
         else:
             self.lm_head = PPMissingLayer()
 
