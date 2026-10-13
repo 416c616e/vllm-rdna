@@ -100,20 +100,31 @@ Scales are per group; zero points in that method are synthesized for the
 symmetric bias, not loaded from an asymmetric checkpoint
 ([`compressed_tensors_moe_wna16_rdna2.py`](https://github.com/opengfx1030/vllm-rdna/blob/e245a4697a139fe8d3bbec4b9c837c37279674e9/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_rdna2.py#L1-L58)).
 
-Router, shared expert, and gated residual stay **dense BF16**. The dot is a
-scalar `v_fma_f32` on values widened to fp32. gfx1030's ISA set does not
-include `v_dot2_f32_bf16` (`FeatureDot12Insts`) or packed fp32 ops
-(`FeaturePackedFP32Ops`); both exist on later targets and are absent from
-`FeatureISAVersion10_3_0`, which is the feature set of the `gfx1030` processor
+Router, shared expert, and gated residual stay **dense** (not quantized).
+The checkpoint stores them as BF16 on disk, but **dest serves fp16**:
+`rdna_fused_glue.cu` accepts `at::kHalf` only
+([`check_weight`](https://github.com/opengfx1030/vllm-rdna/blob/e245a4697a139fe8d3bbec4b9c837c37279674e9/csrc/rocm/rdna_fused_glue.cu#L366-L373)), and the #81 TunableOp CSVs are
+`GemmTunableOp_Half_*` rows only, no BFloat16
+([`tunableop_results0.csv`](https://github.com/opengfx1030/vllm-rdna/blob/e245a4697a139fe8d3bbec4b9c837c37279674e9/bench_results/2026-09-29_tunableop-rows/curated/tunableop_results0.csv)). So on dest these dense parts use
+`v_dot2_f32_f16` (`fdot2`) with fp32 accumulate, the same loop as
+[`moe_resident_decode.cu`](https://github.com/opengfx1030/vllm-rdna/blob/e245a4697a139fe8d3bbec4b9c837c37279674e9/csrc/rocm/moe_resident_decode.cu#L83-L114)
+([wiki plan, "Dense GEMV: dest fp16 path vs true bf16"](https://github.com/BlivionIaG/rdna-hip-wiki/blob/e889bbd3/kernels/persistent/monokernel-gfx1030-plan.md)).
+
+The bf16 widen-then-scalar-`v_fma_f32` path is kept **only for a true bf16
+deployment**, which dest is not. gfx1030's ISA set has neither
+`v_dot2_f32_bf16` (`FeatureDot12Insts`) nor packed fp32 ops
+(`FeaturePackedFP32Ops`)
 ([`AMDGPU.td` `FeatureISAVersion10_3_0`](https://github.com/llvm/llvm-project/blob/eb61ef62df4fd5151c4c379302f636ac430bc32d/llvm/lib/Target/AMDGPU/AMDGPU.td#L2268-L2282),
 [`Dot12Insts`](https://github.com/llvm/llvm-project/blob/eb61ef62df4fd5151c4c379302f636ac430bc32d/llvm/lib/Target/AMDGPU/AMDGPU.td#L924-L926),
-[`PackedFP32Ops`](https://github.com/llvm/llvm-project/blob/eb61ef62df4fd5151c4c379302f636ac430bc32d/llvm/lib/Target/AMDGPU/AMDGPU.td#L801-L803),
-[`GCNProcessors.td` `GFX1030`](https://github.com/llvm/llvm-project/blob/eb61ef62df4fd5151c4c379302f636ac430bc32d/llvm/lib/Target/AMDGPU/GCNProcessors.td)).
-The same split is recorded in
+[`PackedFP32Ops`](https://github.com/llvm/llvm-project/blob/eb61ef62df4fd5151c4c379302f636ac430bc32d/llvm/lib/Target/AMDGPU/AMDGPU.td#L801-L803));
 [`arch.cuh`](https://github.com/opengfx1030/vllm-rdna/blob/e245a4697a139fe8d3bbec4b9c837c37279674e9/csrc/rocm/rdna/common/arch.cuh#L53-L62)
-(`kHasDot2Bf16` is false for RDNA2). The widen-then-`v_fma_f32` choice is the
-recommendation in the
-[wiki silicon plan](https://github.com/BlivionIaG/rdna-hip-wiki/blob/9b91d4116d24414ea2ffd9530d0caeed331ddcd0/kernels/persistent/monokernel-gfx1030-plan.md).
+records `kHasDot2Bf16` false for RDNA2. Casting true bf16 weights to fp16 to
+reach fdot2 is avoided (fp16 range ±65504) ([wiki plan](https://github.com/BlivionIaG/rdna-hip-wiki/blob/e889bbd3/kernels/persistent/monokernel-gfx1030-plan.md)).
+
+**Router numerics.** Router logits come out in fp32. Sigmoid/softmax, bias
+correction and top-k run **once** in fp32, and the combine reuses the same
+ids and weights ([wiki plan](https://github.com/BlivionIaG/rdna-hip-wiki/blob/e889bbd3/kernels/persistent/monokernel-gfx1030-plan.md)).
+
 A V620 microbench of that GEMV is **(unverified)**.
 
 ### Out of v1
@@ -200,6 +211,9 @@ Detail and the order of work are in [plan.md](plan.md). Summary:
    the same build with the kernel off. The RFC's accuracy bar is full GSM8K
    (1,319 questions) plus a paired comparison
    ([RFC, report](https://github.com/vllm-project/vllm/issues/60904)).
+   Plus a long-context KL check against the BF16 reference, because residual
+   and gated-residual activations can exceed the fp16 max (±65504)
+   ([wiki plan](https://github.com/BlivionIaG/rdna-hip-wiki/blob/e889bbd3/kernels/persistent/monokernel-gfx1030-plan.md)); see `plan.md` phase 3 for how to measure it.
    No number in that cell exists yet **(unverified)**.
 5. **4.** One spec per layer type. #61325 describes Flash-Next as 48 decoder
    layers, 36 GDN and 12 QSA, with a QSA indexer on every fourth layer

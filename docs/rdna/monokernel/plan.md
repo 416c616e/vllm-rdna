@@ -62,7 +62,9 @@ Answer these from a serve log on dest, not from this page:
 ## 2a — FFN compute only
 
 Kernel contents, in order: residual add and norm, router, shared expert
-(dense BF16, scalar `v_fma_f32`), routed experts (symmetric group W4A16,
+(dense, served fp16 on dest, `fdot2` with fp32 accumulate; router logits
+and top-k in fp32, combine reuses the same ids/weights;
+[wiki plan](https://github.com/BlivionIaG/rdna-hip-wiki/blob/e889bbd3/kernels/persistent/monokernel-gfx1030-plan.md)), routed experts (symmetric group W4A16,
 `fdot2`). vLLM's all-reduce runs **before** the kernel and **after** it.
 Do not change the `VLLM_RDNA_AR` protocol or its size gate
 ([tuning guide](https://github.com/opengfx1030/vllm-rdna/blob/e245a4697a139fe8d3bbec4b9c837c37279674e9/docs/rdna2/tuning.md)).
@@ -108,7 +110,7 @@ the RFC rule. The numeric bound is **(unverified)** until 2b is designed.
 
 Do not land 2b on a timeout that still returns tokens.
 
-## 3 — TPOT and GSM8K
+## 3 — TPOT, GSM8K and long-context KL
 
 Report time per output token, graphs against graphs, same batch cap:
 
@@ -126,6 +128,20 @@ GSM8K: full 1,319 questions, graphs on, against the same build with the
 kernel off, plus the RFC's paired comparison. #61325 used the model-card
 recipe (thinking off, 2,048 tokens) and scored inside the stock spread.
 Use that recipe as the procedure. The score itself is **(unverified)**.
+
+Long-context KL against the BF16 reference: residual and gated-residual
+activations can exceed the fp16 max (±65504), so run long contexts
+([wiki plan](https://github.com/BlivionIaG/rdna-hip-wiki/blob/e889bbd3/kernels/persistent/monokernel-gfx1030-plan.md)). The overflow magnitude on Flash-Next is
+**(unverified)** until measured on the V620.
+
+- **Exact KL** needs the full logits dumped from the engine itself, on both
+  the fp16 dest run and the BF16 reference.
+- The OpenAI-compatible API returns only top-k logprobs, capped by
+  `--max-logprobs` (default 20,
+  [`ModelConfig.max_logprobs`](https://github.com/vllm-project/vllm/blob/main/vllm/config/model.py)), so a KL from it is **truncated**.
+- If the API is used anyway, hit vLLM directly on both sides, not through
+  LiteLLM or another gateway, so nothing rewrites `logprobs` /
+  `top_logprobs`.
 
 Phase 3 is the gate that decides whether 2b is worth opening. It is also
 required again after 2b if 2b lands.
