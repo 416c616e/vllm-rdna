@@ -174,7 +174,8 @@ if [[ -n $REQUIRED_VARS ]]; then
         rdna_require "$_rv"
     done
 fi
-[[ -n $KV ]] || rdna_die "no KV budget set; add KV=<bytes> (or KVCAP=) to recipe '$rdse_recipe'."
+[[ -n $KV ]] || rdna_die "no KV budget set; add KV=<bytes> (or KV=auto with GMEM=) to recipe '$rdse_recipe'."
+[[ $KV != auto || -n $GMEM ]] || rdna_die "KV=auto sizes the cache from free memory; set GMEM=<fraction> too."
 if [[ -n $MIN_MAXLEN && -n $MAXLEN ]] && ((MAXLEN < MIN_MAXLEN)); then
     rdna_die "MAXLEN=$MAXLEN is below the $MIN_MAXLEN floor required by recipe '$rdse_recipe'."
 fi
@@ -318,7 +319,8 @@ cmd+=(--max-num-seqs "$SEQS" --max-num-batched-tokens "$MAXBAT")
 [[ -n $PREFILL_INTERVAL ]] && cmd+=(--prefill-schedule-interval "$PREFILL_INTERVAL")
 [[ -n $DIST_TIMEOUT ]] && cmd+=(--distributed-timeout-seconds "$DIST_TIMEOUT")
 [[ -n $GMEM ]] && cmd+=(--gpu-memory-utilization "$GMEM")
-cmd+=(--kv-cache-memory-bytes "$KV")
+# KV=auto: let vLLM size the cache from --gpu-memory-utilization after profiling.
+[[ $KV != auto ]] && cmd+=(--kv-cache-memory-bytes "$KV")
 if [[ $EAGER == 1 ]]; then
     cmd+=(--enforce-eager)
 elif [[ -n $comp_config ]]; then
@@ -378,7 +380,7 @@ RDSE_ENV_KEYS=(
     VLLM_RDNA_AR_ONESHOT_KB VLLM_RDNA_AR_BLOCKS VLLM_RDNA_AR_PACE
     VLLM_CAUSAL_CONV1D_RDNA2_FWD VLLM_CAUSAL_CONV1D_RDNA2_UPDATE
     VLLM_ENABLE_STARTUP_PLAN VLLM_TUNED_CONFIG_FOLDER
-    VLLM_ROCM_SKIP_LIVE_TAIL_HASH
+    VLLM_ROCM_SKIP_LIVE_TAIL_HASH VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
     VLLM_PLE_CPU_OFFLOAD VLLM_PLE_OFFLOAD_READY_TIMEOUT VLLM_PLE_QUANT_DIR
     VLLM_EXL3_DEBUG
     VLLM_RDNA_DECODE_STALL_MS VLLM_RDNA_DECODE_SHARE VLLM_DECODE_STALL_MAX_OVERHEAD VLLM_DECODE_STALL_FIT_ALL

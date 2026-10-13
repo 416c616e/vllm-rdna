@@ -48,7 +48,8 @@ actually sets.
 | `P2P` | 1, 0 | `0` = no PCIe peer-to-peer: `VLLM_RDNA_AR=0` (overrides the recipe) + `NCCL_P2P_DISABLE=1` (RCCL over host shared memory). For hosts where P2P is broken, and to bisect wrong output. Slower decode. |
 | `TUNABLEOP`, `TUNABLEOP_PROFILE` | 1 / name | TunableOp lookup on/off, force a named profile. |
 | `TUNED_CONFIG` | 0, 1 | Use `tuned-moe/` MoE configs (`VLLM_TUNED_CONFIG_FOLDER`). |
-| `SEQS`, `MAXBAT`, `MAXLEN`, `KV`, `GMEM`, `BLOCK_SIZE`, `LPTH`, `PREFILL_INTERVAL` | | `--max-num-seqs`, `--max-num-batched-tokens`, `--max-model-len`, `--kv-cache-memory-bytes`, `--gpu-memory-utilization`, `--block-size`, `--long-prefill-token-threshold`, `--prefill-schedule-interval`. |
+| `SEQS`, `MAXBAT`, `MAXLEN`, `KV`, `GMEM`, `BLOCK_SIZE`, `LPTH`, `PREFILL_INTERVAL` | | `--max-num-seqs`, `--max-num-batched-tokens`, `--max-model-len`, `--kv-cache-memory-bytes`, `--gpu-memory-utilization`, `--block-size`, `--long-prefill-token-threshold`, `--prefill-schedule-interval`. `KV=auto` (needs `GMEM`) drops `--kv-cache-memory-bytes` so vLLM sizes the cache after profiling. |
+| `PP`, `PP_PARTITION` | | `--pipeline-parallel-size`; layers per stage → `VLLM_PP_LAYER_PARTITION`. See [Pipeline parallel](#pipeline-parallel-3-or-4-cards). |
 | `ALLOC_CONF` | true, false, auto | `expandable_segments`. `auto` turns it off with the PLE sidecar. |
 | `FEATURES` | tokens | `prefix-caching mamba-align expert-parallel language-model-only skip-mm-profiling vision-cap trust-remote-code reasoning auto-tool prompt-tokens-details`. |
 | `HIP_VISIBLE_DEVICES` / `GPUIDS` | | GPUs. Keep a TP group on one PCIe switch. |
@@ -123,6 +124,55 @@ actually sets.
 | `VLLM_DECODE_STALL_MAX_OVERHEAD` | 0.25 | Floor on the cap so per-step fixed cost stays below this fraction of per-token work. |
 | `VLLM_DECODE_STALL_FIT_ALL` | auto | Fit step cost on all prefill steps (dense default) or mixed steps only (MoE default). |
 | `VLLM_RDNA_DYNAMIC_PREFILL` | 0 | Experimental live tuning of chunk cap and cadence. |
+
+### Pipeline parallel (3 or 4 cards)
+
+Flash-Next has nothing that divides by 3 (heads, experts, `moe_intermediate`),
+so three cards means PP=3 at TP=1. Recipes `flashnext-pp3` (MTP0) and
+`flashnext-pp3-mtp2` follow
+[alanoo81/flashnext-v620-pp3](https://github.com/alanoo81/flashnext-v620-pp3):
+text-only, 262K, KV sized from free memory, int4 PLE.
+
+- **Step budget vs the Mamba block.** With prefix caching in `align` mode the
+  block is 2048 tokens and prefill chunks are whole blocks. When decode tokens
+  share the step, `MAXBAT` must exceed the block by the decode tokens of a full
+  batch, or admission stalls (16K c=4 at MTP2: 3 running + 1 waiting at 2048,
+  4 running at 2112). PP3 MTP2: `MAXBAT=2112` (2048 + 4 seqs × 3). TP2×PP2
+  MTP2 at 8 seqs: `MAXBAT=4096`. Sub-block chunks are not an option (they
+  poison the prefix cache, upstream #43559).
+- **Decode cadence.** Each request decodes every `pp_size` steps, so per-request
+  decode at c>1 drops; MTP pays off up to ~4 streams, MTP0 above.
+- **Memory.** Vision does not fit next to stage 0's layers (text-only), dense
+  INT8 must be `ONLY` mode, and the MTP drafter needs the W4A16 drafter
+  checkpoint (`tools/rdna/quant_mtp_experts.py`). Under PP the drafter shares
+  the last stage's target embedding and `lm_head` (CPU placeholders until
+  shared). On 30 GB V620s a full 262K request at MTP2 needs `GMEM=0.975`
+  (0.95 caps the length at ~188K); 32 GB cards fit it at 0.95.
+- **Partition.** 16,16,16 for MTP0; 17,17,14 for MTP2 (the drafter sits on the
+  last stage). PLE layers must stay on stage 0.
+
+Measured on 3× / 4× V620 (int4 PLE, F&P, `--temperature 0`, 2026-10-13):
+
+| Config | Cell | Prefill tok/s/req (agg) | Decode tok/s/req (agg out) | TTFT | ITL med |
+|---|---|---|---|---|---|
+| PP3 MTP0 (`flashnext-pp3`, KV 398K tok) | 1k/512 c=1 | 842 (835) | 38.4 (35.2) | 1.22 s | 26.1 ms |
+| | 1k/512 c=8 | 204 (1078) | 9.0 (66.3) | 5.01 s | 106 ms |
+| | 16k/1k c=1 | 1848 (1811) | 38.0 (28.6) | 8.87 s | 26.4 ms |
+| | 16k/1k c=8 | 771 (1589) | 7.7 (53.3) | 21.3 s | 63.4 ms |
+| PP3 MTP2 (`flashnext-pp3-mtp2`, KV 268K tok) | 1k/512 c=1 | 845 (842) | 57.7 (50.8) | 1.21 s | 36.3 ms |
+| | 1k/512 c=4 | 535 (847) | 12.4 (46.1) | 1.92 s | 120 ms |
+| | 16k/1k c=1 | 1866 (1839) | 70.9 (44.1) | 8.78 s | 37.0 ms |
+| | 16k/1k c=4 | 1071 (3088) | 10.1 (34.7) | 15.3 s | 122 ms |
+| TP2×PP2 MTP2 (`flashnext-mtp2 TP=2 PP=2 MAXBAT=4096`) | 1k/512 c=1 | 1496 (1453) | 52.6 (49.2) | 0.68 s | 37.8 ms |
+| | 1k/512 c=8 | 565 (1309) | 13.7 (100.5) | 1.81 s | 141 ms |
+| | 16k/1k c=1 | 2199 (2189) | 54.8 (39.2) | 7.45 s | 38.1 ms |
+| | 16k/1k c=8 | 1055 (2399) | 8.6 (59.8) | 15.5 s | 132 ms |
+
+On four cards TP=4 MTP2 decodes faster (16k c=1 76–87 tok/s, 16k c=8 ITL
+~62 ms) while TP2×PP2 has higher aggregate prefill at 16k c=8 (2399 vs
+1050–1350 tok/s). PP2's concurrency gate shows the known prompt-1 near-tie
+flip. Raw runs: infrastructure `bench_results/2026-10-13_pp3-mtp2/` and
+`2026-10-13_bundle-final-ab/` (TP4).
 
 ### PLE table (Flash-Next)
 
