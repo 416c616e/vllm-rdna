@@ -893,13 +893,17 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
-        # engine from loading weights first.
-        if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
-                "because non-first pipeline ranks do not receive the raw input_ids "
-                "it needs. Please run with PP=1."
-            )
+        # engine from loading weights first. RDNA allows PP > 1 when every PLE
+        # layer sits on the first pipeline stage.
+        from vllm.models.qwen4_exp.common.ple_pp import (
+            rdna_ple_pp_unsupported_reason,
+        )
+
+        reason = rdna_ple_pp_unsupported_reason(
+            text_config, parallel_config.pipeline_parallel_size
+        )
+        if reason is not None:
+            raise NotImplementedError(reason)
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)

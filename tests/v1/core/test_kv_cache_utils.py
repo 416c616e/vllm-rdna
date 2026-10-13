@@ -1826,6 +1826,35 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
+def test_get_kv_cache_configs_pp_uniform_group_absent_from_worker():
+    """A UniformTypeKVCacheSpecs group with no layer on a PP stage must not
+    leak the other stages' layers into that stage's KV cache tensors."""
+    model_config = ModelConfig(max_model_len=512)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+
+    spec_a = new_kv_cache_spec()
+    spec_b = new_kv_cache_spec(num_kv_heads=4)
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={"layer1": spec_a, "layer2": spec_b},
+    )
+    global_groups = [KVCacheGroupSpec(["layer1", "layer2"], uniform_spec)]
+    # Stage 1 owns neither layer of the uniform group.
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+        global_groups, {"layer3": spec_a}
+    )
+    assert projected[0].layer_names == []
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        projected + [KVCacheGroupSpec(["layer3"], spec_a)],
+        spec_a.page_size_bytes * 64,
+    )
+    tensor_layers = [name for t in config.kv_cache_tensors for name in t.layers]
+    assert tensor_layers == ["layer3"]
+
+
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("disable_hybrid", [False, True])
 @pytest.mark.parametrize("pcp_size", [1, 4])

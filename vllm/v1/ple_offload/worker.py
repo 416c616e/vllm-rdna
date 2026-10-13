@@ -265,6 +265,11 @@ class PleOffloadWorker:
         death_pipe: Connection,
     ) -> None:
         """Load PLE weights, accept registrations, and run the request loop."""
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            # This process builds the model in an isolated PP1 world; a layer
+            # partition meant for the GPU stages would fail get_pp_indices.
+            os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+            envs.disable_envs_cache()
         decorate_logs("PleOffloadWorker")
         ready_reader, ready_writer = ready_pipe
         ready_reader.close()

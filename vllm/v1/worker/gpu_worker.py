@@ -276,7 +276,18 @@ class Worker(WorkerBase):
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
         if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
+            # RDNA: PP is fine when every PLE layer sits on the first stage.
+            # Global rank 0 spawns the offload worker and only stage-0 ranks
+            # register with it (see load_model).
+            from vllm.models.qwen4_exp.common.ple_pp import (
+                rdna_ple_pp_unsupported_reason,
+            )
+
+            if rdna_ple_pp_unsupported_reason(
+                self.model_config.hf_text_config,
+                parallel_config.pipeline_parallel_size,
+            ):
+                unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:
@@ -663,7 +674,12 @@ class Worker(WorkerBase):
             get_ec_transfer().start_worker_services()
         # Model loading constructs the PLE placeholders whose CUDA buffers are
         # registered by the shared MRV1/MRV2 offload client.
-        if self._ple_offload_enabled:
+        # With PP > 1 only the first stage holds PLE layers; later stages have
+        # nothing to register (the offload worker expects DP x TP clients).
+        if self._ple_offload_enabled and (
+            self.parallel_config.pipeline_parallel_size == 1
+            or get_pp_group().is_first_rank
+        ):
             self.model_runner._setup_ple_offload(
                 self.parallel_config._ple_offload_ipc_path
             )
