@@ -432,7 +432,7 @@ void moe_w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
     moe_gptq_gemm_rdna2(a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
                         sorted_token_ids, expert_ids, num_tokens_post_padded,
                         top_k, block_size_m, mul_topk_weight, output_topk,
-                        fp32_accum);
+                        fp32_accum, use_v2_format);
   };
 
   if (!a.is_cuda() || !c.is_cuda() || !b_q_weight.is_cuda() ||

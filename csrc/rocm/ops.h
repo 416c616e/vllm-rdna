@@ -191,7 +191,8 @@ void moe_gptq_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                          torch::Tensor expert_ids,
                          torch::Tensor num_tokens_post_padded, int64_t top_k,
                          int64_t block_size_m, bool mul_topk_weight,
-                         int64_t output_topk, bool fp32_accum);
+                         int64_t output_topk, bool fp32_accum,
+                         bool use_v2_format);
 
 // W4A8 (int4 weights, int8 activations) fused MoE for gfx1030. Opt-in
 // drop-in for moe_gptq_gemm_rdna2 on the same packed weight layout: quants the

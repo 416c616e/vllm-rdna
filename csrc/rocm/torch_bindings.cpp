@@ -277,7 +277,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor sorted_token_ids, Tensor expert_ids, "
       "Tensor num_tokens_post_padded, "
       "int top_k, int block_size_m, bool mul_topk_weight, "
-      "int output_topk, bool fp32_accum=True) -> ()");
+      "int output_topk, bool fp32_accum=True, "
+      "bool use_v2_format=False) -> ()");
   rocm_ops.impl("moe_gptq_gemm_rdna2", torch::kCUDA, &moe_gptq_gemm_rdna2);
 
   // W4A8 (int4 weights, int8 activations) fused MoE for gfx1030. Drop-in for
