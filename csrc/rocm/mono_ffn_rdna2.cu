@@ -550,7 +550,11 @@ __global__ void __launch_bounds__(kThreads)
   const int gw = wg * kWaves + wave, GW = G * kWaves;
   const int M = p.M, H = p.H, HCH = kHC * p.H, R = p.R, ND = p.ND;
 
-  if (err_set(p.ctrl)) return;  // fail-stop: a previous launch timed out
+  if (err_set(p.ctrl)) {  // fail-stop: a previous launch timed out
+    for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
+      p.out[i] = __float2half(__int_as_float(0x7fc00000));  // NaN, not stale data
+    return;
+  }
   if (wg == 0 && tid == 0) {
     p.ctrl->ts[0] = wall_clock64();
     p.ctrl->pad[0] = G;  // grid actually launched

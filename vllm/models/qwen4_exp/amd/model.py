@@ -79,6 +79,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import ATTENTION_LAYER_TYPES, QSA_LAYER_TYPE, Qwen4ExpConfig
+from . import mono_ffn
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
@@ -276,6 +277,21 @@ class Qwen4ExpDecoderLayer(nn.Module):
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
 
+        # MonoKernel 2a (opt-in): the decode FFN block in one persistent launch.
+        # Main-model MoE layers only; the MTP drafter keeps its modules.
+        self._mono_ffn = None
+        if (
+            is_moe_layer
+            and ".mtp." not in f".{prefix}."
+            and mono_ffn.mono_ffn_requested(vllm_config)
+            and mono_ffn.mono_ffn_supported(vllm_config)
+        ):
+            self._mono_ffn = mono_ffn.MonoFFN(self)
+            self._mono_name = f"{prefix}.mono_ffn"
+            vllm_config.compilation_config.static_forward_context[self._mono_name] = (
+                self._mono_ffn
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -334,6 +350,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             raise ValueError("Invalid layer_type")
+
+        if self._mono_ffn is not None:
+            return torch.ops.vllm.rdna_mono_ffn_block(
+                hidden_states, attn_out, injection, self._mono_name
+            )
 
         mlp_hc = self.mlp_hyper_connection
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(

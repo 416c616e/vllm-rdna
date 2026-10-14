@@ -85,6 +85,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "rdna_hc_mix_prefill(Tensor xn, Tensor w_down, Tensor w_up, "
       "int lora_rank, int hc_count) -> (Tensor, Tensor)");
   rocm_ops.impl("rdna_hc_mix_prefill", torch::kCUDA, &rdna_hc_mix_prefill);
+  // MonoKernel 2a: persistent decode FFN block (vllm/models/qwen4_exp/amd/mono_ffn.py).
+  rocm_ops.def(
+      "mono_ffn_rdna2_workspace_bytes(int H, int R, int ND, int E, int Ise, "
+      "int I) -> int");
+  rocm_ops.impl("mono_ffn_rdna2_workspace_bytes", &mono_ffn_rdna2_workspace_bytes);
+  rocm_ops.def(
+      "mono_ffn_rdna2(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, "
+      "Tensor wd, Tensor wu, Tensor wr, Tensor se_w1, Tensor se_w2, "
+      "Tensor se_wg, Tensor w13, Tensor s13, Tensor z13, Tensor w2, Tensor s2, "
+      "Tensor z2, Tensor! res_out, Tensor! inj_out, Tensor! out, "
+      "Tensor! workspace, int expert_base, int zero_offset, int num_wg, "
+      "float eps, float timeout_ms) -> ()");
+  rocm_ops.impl("mono_ffn_rdna2", torch::kCUDA, &mono_ffn_rdna2);
+  rocm_ops.def("mono_ffn_rdna2_error(Tensor workspace) -> Tensor");
+  rocm_ops.impl("mono_ffn_rdna2_error", torch::kCUDA, &mono_ffn_rdna2_error);
 #endif
   rocm_ops.def(
       "rdna_se_gate_up_silu(Tensor x, Tensor w, Tensor? scale) -> Tensor");
