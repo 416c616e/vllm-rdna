@@ -332,7 +332,12 @@ for feat in $FEATURES; do
     case $feat in
         trust-remote-code) cmd+=(--trust-remote-code) ;;
         prefix-caching)
-            [[ $ENABLE_PREFIX_CACHING != 0 ]] && cmd+=(--enable-prefix-caching)
+            # vLLM enables prefix caching by default, so off must be explicit.
+            if [[ $ENABLE_PREFIX_CACHING != 0 ]]; then
+                cmd+=(--enable-prefix-caching)
+            else
+                cmd+=(--no-enable-prefix-caching)
+            fi
             ;;
         prompt-tokens-details) cmd+=(--enable-prompt-tokens-details) ;;
         auto-tool) cmd+=(--enable-auto-tool-choice --tool-call-parser qwen3_coder) ;;
