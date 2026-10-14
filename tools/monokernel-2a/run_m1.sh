@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # M1 standalone run on one V620: builds the kernel as a JIT extension and runs
 # m1_bench.py against this tree's vLLM ops.
-#   GPU=2 OUT=~/w4a8_runs/monokernel-2a/m1 bash tools/monokernel-2a/run_m1.sh [m1_bench args]
+#   GPU=6 OUT=~/w4a8_runs/monokernel-2a/m1 bash tools/monokernel-2a/run_m1.sh [m1_bench args]
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 TREE=$(cd "$HERE/../.." && pwd)
 VENV=${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.31.0-final}
 OUT=${OUT:-$HOME/w4a8_runs/monokernel-2a/m1}
-GPU=${GPU:-2}
-case ",$GPU," in *,0,* | *,1,* | *,6,* | *,7,* | *,8,* | *,9,*) echo "HIP 2-5 only"; exit 2 ;; esac
+GPU=${GPU:-6}
+case ",$GPU," in *,0,* | *,1,* | *,2,* | *,3,* | *,4,* | *,5,*) echo "HIP 6-9 only"; exit 2 ;; esac
 mkdir -p "$OUT" "$OUT/ext_build" "$OUT/run"
 SITE=$VENV/lib/python3.12/site-packages
 export LD_LIBRARY_PATH=$SITE/_rocm_sdk_libraries/lib:$SITE/_rocm_sdk_core/lib/host-math/lib:$SITE/_rocm_sdk_core/lib/rocm_sysdeps/lib:$SITE/_rocm_sdk_core/lib/core/lib:$SITE/torch/lib

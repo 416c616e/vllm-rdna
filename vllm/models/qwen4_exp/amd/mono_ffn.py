@@ -16,7 +16,15 @@ branch follows the actual batch, not the trace-time size.
 
 Fail-stop: a timed-out grid barrier leaves a sticky record; later launches
 exit at once and fill the FFN output with NaN instead of returning stale data.
+
+Diagnostics (additional_config, off by default): ``rdna_mono_ffn_timing``
+brackets the FFN block + its all-reduce inside FULL graphs with timestamp
+kernels and turns on the kernel's per-width phase/entry stats; the per-width
+means are logged on eager steps. ``rdna_mono_ffn_modules`` keeps today's
+modules in FULL graphs too (the switch-off reference with the same marks).
 """
+
+import time
 
 import torch
 
@@ -27,12 +35,25 @@ logger = init_logger(__name__)
 
 MAX_ROWS = 24
 _WORKSPACES: dict[int, torch.Tensor] = {}
+_STATS: dict[int, torch.Tensor] = {}
 _LOGGED: set = set()
+_TIMING = False
+_FORCE_MODULES = False
+_STAT_COLS = 16
+_STAT_ROWS = MAX_ROWS + 1
+_STAT_WORDS = (_STAT_ROWS + 1) * _STAT_COLS
+_TICKS_PER_US = 100.0  # wall_clock64 runs at 100 MHz on V620
+_last_log = [0.0]
 
 
 def mono_ffn_requested(vllm_config) -> bool:
+    global _TIMING, _FORCE_MODULES
     extra = getattr(vllm_config, "additional_config", None) or {}
-    return bool(isinstance(extra, dict) and extra.get("rdna_mono_ffn", False))
+    if not isinstance(extra, dict):
+        return False
+    _TIMING = bool(extra.get("rdna_mono_ffn_timing", False))
+    _FORCE_MODULES = bool(extra.get("rdna_mono_ffn_modules", False))
+    return bool(extra.get("rdna_mono_ffn", False))
 
 
 def mono_ffn_supported(vllm_config) -> bool:
@@ -57,7 +78,36 @@ def _workspace(device: torch.device) -> torch.Tensor:
         nbytes = int(torch.ops._rocm_C.mono_ffn_rdna2_workspace_bytes(2560, 320, 336, 512, 160, 640))
         ws = torch.zeros(nbytes + 4096, dtype=torch.uint8, device=device)
         _WORKSPACES[idx] = ws
+        if _TIMING:  # stats block right after the kernel's workspace
+            st = ws[nbytes : nbytes + _STAT_WORDS * 8].view(torch.int64)
+            st[_STAT_ROWS * _STAT_COLS + 0] = -1  # entry_min
+            st[_STAT_ROWS * _STAT_COLS + 3] = 1  # enabled
+            _STATS[idx] = st
     return ws
+
+
+def _log_stats():
+    """Per-width means (µs) of the serve timing, all devices of this process."""
+    now = time.monotonic()
+    if now - _last_log[0] < 30.0:
+        return
+    _last_log[0] = now
+    for idx, st in _STATS.items():
+        a = st.view(-1, _STAT_COLS).cpu()
+        for w in range(1, _STAT_ROWS):
+            r = a[w].tolist()
+            n, nm = r[0], r[12]
+            if n == 0 and nm == 0:
+                continue
+            us = lambda v, k: v / k / _TICKS_PER_US if k else 0.0  # noqa: E731
+            ph = "/".join(f"{us(r[i], n):.1f}" for i in range(1, 8))
+            logger.info(
+                "rdna_mono_ffn timing dev%d w%d: region n=%d %.1f us | kernel n=%d "
+                "total %.1f phases %s | entry spread %.1f wg0 %.1f | mark->first %.1f "
+                "mark->last %.1f",
+                idx, w, nm, us(r[13], nm), n, us(r[9], n), ph, us(r[8], n),
+                us(r[10], n), us(r[14], n), us(r[15], n),
+            )
 
 
 class MonoFFN:
@@ -184,25 +234,35 @@ def _mono_ffn_block(
         # Resolve weights / allocate the workspace on an eager step (profile
         # and warmup runs precede capture); nothing here may run in a capture.
         mono.setup()
-    use = (
+    full = (
         0 < m <= MAX_ROWS
         and hidden_states.dtype == torch.float16
         and mono.ready
         and _in_full_graph()
     )
+    use = full and not _FORCE_MODULES
     key = (m, use)
     if key not in _LOGGED:
         _LOGGED.add(key)
         logger.info("rdna_mono_ffn: %d rows -> %s", m, "mono kernel" if use else "modules")
+    st = _STATS.get(hidden_states.device.index) if (_TIMING and full) else None
+    if _TIMING and not torch.cuda.is_current_stream_capturing():
+        _log_stats()
+    if st is not None:
+        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 0, m)
     if use:
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         res_out, partial, inj_out = mono.run(hidden_states, attn_out, injection)
-        return res_out, tensor_model_parallel_all_reduce(partial), inj_out
-    hs, block_input, inj = layer.mlp_hyper_connection.combine_and_mix(
-        hidden_states, attn_out, injection
-    )
-    return hs, layer.mlp(block_input), inj
+        result = res_out, tensor_model_parallel_all_reduce(partial), inj_out
+    else:
+        hs, block_input, inj = layer.mlp_hyper_connection.combine_and_mix(
+            hidden_states, attn_out, injection
+        )
+        result = hs, layer.mlp(block_input), inj
+    if st is not None:
+        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 1, m)
+    return result
 
 
 def _mono_ffn_block_fake(hidden_states, attn_out, injection, layer_name):

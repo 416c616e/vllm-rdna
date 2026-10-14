@@ -20,7 +20,7 @@ wait_idle() {  # rocm-smi GPU[0-3] are HIP 6-9 on this box; the last server may 
 for spec in $ORDER; do
     IFS=: read -r mtp arm rep <<< "$spec"
     wait_idle || { echo "GPUs not idle"; exit 1; }
-    tag=m3-$mtp-$arm-$rep
+    tag=${TAGP:-m3}-$mtp-$arm-$rep
     echo "== $(date +%H:%M:%S) $tag"
     ARM=$arm RECIPE=flashnext-$mtp TAG=$tag CACHE=$HOME/w4a8_runs/monokernel-2a/cache-2a-$arm \
         CELLS="$CELLS" BENCH_EXTRA="--temperature 0" LOAD_HOOK=${LOAD_HOOK:-$HERE/parity_hook.sh} \

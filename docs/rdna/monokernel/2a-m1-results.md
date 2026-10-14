@@ -1,5 +1,9 @@
 # MonoKernel 2a, milestone M1 (V620 / gfx1030, 2026-10-14)
 
+> Superseded: the reworked kernel (1.15-1.59x standalone), M2, M3 and the
+> in-serve timing are in [`2a-results.md`](./2a-results.md). This page records
+> the first kernel version.
+
 Standalone result of the FFN-only persistent kernel against today's Flash-Next
 decode FFN block, before any integration. **Verdict: the kernel is correct but
 does not beat today's block at widths 3 and 24 (0.91x at both). Per the plan

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One flashnext-mtp2 serve (INT4 PLE) of this tree through serve_validate.sh,
 # MonoKernel switch off or on.
-#   ARM=on TAG=m2-on GPUS=2,3,4,5 PORT=18790 bash tools/monokernel-2a/serve_2a.sh [KEY=v ...]
+#   ARM=on TAG=m2-on GPUS=6,7,8,9 PORT=18790 bash tools/monokernel-2a/serve_2a.sh [KEY=v ...]
 # ARM=on adds --additional-config {"rdna_mono_ffn":true}. CELLS / BENCH_EXTRA /
 # PPL_PROBE ... pass through to serve_validate.sh. The LOAD_HOOK dumps greedy
 # top-5 logprobs (logprob_parity.py) for the off/on comparison.
@@ -16,8 +16,16 @@ export RECIPE=${RECIPE:-flashnext-mtp2} GPUS PORT=${PORT:-18790} TAG=${TAG:-2a-$
 export OUT=$RUN/serve-$TAG CACHE=${CACHE:-$RUN/cache-2a-$ARM}
 export VENV=${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.31.0-final}
 export LOAD_HOOK=${LOAD_HOOK:-$HERE/parity_hook.sh}
-if [[ $ARM == on ]]; then
-    export EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--additional-config {\"rdna_mono_ffn\":true}"
+# ARM=on-t / off-t: serve timing marks (mono_ffn.py), off-t keeps today's modules.
+case $ARM in
+    on) AC='{"rdna_mono_ffn":true}' ;;
+    on-t) AC='{"rdna_mono_ffn":true,"rdna_mono_ffn_timing":true}' ;;
+    off-t) AC='{"rdna_mono_ffn":true,"rdna_mono_ffn_timing":true,"rdna_mono_ffn_modules":true}' ;;
+    off) AC= ;;
+    *) echo "ARM=on|off|on-t|off-t" >&2; exit 2 ;;
+esac
+if [[ -n $AC ]]; then
+    export EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--additional-config $AC"
 fi
 exec bash "$TREE/tools/rdna/port_v031/serve_validate.sh" \
     PLE=int4 PLE_QUANT_DIR="$PLE_QUANT_DIR" "$@"

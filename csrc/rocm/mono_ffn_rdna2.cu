@@ -107,7 +107,20 @@ struct Params {
   float eps;
   int prefetch;  // 1: waves 1..7 touch the next phase's weights while waiting
   unsigned long long timeout_ticks;
+  // Optional serve timing (workspace tail, see kStat*): per-width sums of the
+  // phase times, the WG entry spread and the launch latency after a mark.
+  unsigned long long* stats;
 };
+
+// Stats block: kStatRows rows of kStatCols uint64 per width M (1..24), then a
+// scratch row {entry_min, entry_max, mark_t0, enabled}. Row columns:
+//  0 launches  1..7 phase P1..P7 (WG0)  8 last-first WG entry
+//  9 first entry -> end  10 first entry -> WG0 entry
+//  12 marked regions  13 marked region time  14 mark -> first entry
+//  15 mark -> last entry.  Wall-clock ticks (100 MHz on V620).
+constexpr int kStatCols = 16;
+constexpr int kStatRows = kMaxM + 1;
+constexpr int kStatWords = (kStatRows + 1) * kStatCols;
 
 __device__ __forceinline__ float silu_f(float v) { return v / (1.f + __expf(-v)); }
 __device__ __forceinline__ float sigmoid_f(float v) { return 1.f / (1.f + __expf(-v)); }
@@ -554,6 +567,13 @@ __global__ void __launch_bounds__(kThreads)
     for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
       p.out[i] = __float2half(__int_as_float(0x7fc00000));  // NaN, not stale data
     return;
+  }
+  unsigned long long* const sc = p.stats ? p.stats + kStatRows * kStatCols : nullptr;
+  const bool timing = sc && sc[3] != 0;
+  if (timing && tid == 0) {
+    const unsigned long long t = wall_clock64();
+    atomicMin(&sc[0], t);
+    atomicMax(&sc[1], t);
   }
   if (wg == 0 && tid == 0) {
     p.ctrl->ts[0] = wall_clock64();
@@ -1162,7 +1182,42 @@ __global__ void __launch_bounds__(kThreads)
   // ---------------- P7: out = fp16(shared + routed)
   for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
     p.out[i] = __float2half(p.acc[i]);
-  if (wg == 0 && tid == 0) p.ctrl->ts[7] = wall_clock64();
+  if (wg == 0 && tid == 0) {
+    p.ctrl->ts[7] = wall_clock64();
+    if (timing) {  // every WG entered before barrier 1, so min/max are final
+      const unsigned long long emin =
+          __hip_atomic_load(&sc[0], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      const unsigned long long emax =
+          __hip_atomic_load(&sc[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      unsigned long long* row = p.stats + M * kStatCols;
+      const unsigned long long* ts = p.ctrl->ts;
+      row[0] += 1;
+      for (int i = 1; i < 8; i++) row[i] += ts[i] - ts[i - 1];
+      row[8] += emax - emin;
+      row[9] += ts[7] - emin;
+      row[10] += ts[0] - emin;
+      const unsigned long long t0 = sc[2];
+      if (t0 != 0 && emin > t0) {
+        row[14] += emin - t0;
+        row[15] += emax - t0;
+      }
+      __hip_atomic_store(&sc[0], ~0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&sc[1], 0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+}
+
+// Serve timing marks around an FFN region (kind 0: start, 1: end).
+__global__ void mono_mark_kernel(unsigned long long* stats, int kind, int width) {
+  unsigned long long* sc = stats + kStatRows * kStatCols;
+  const unsigned long long t = wall_clock64();
+  if (kind == 0) {
+    sc[2] = t;
+  } else {
+    unsigned long long* row = stats + width * kStatCols;
+    row[12] += 1;
+    row[13] += t - sc[2];
+  }
 }
 
 }  // namespace mono_ffn
@@ -1246,6 +1301,12 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
   p.se_g = reinterpret_cast<float*>(take((int64_t)kMaxM * 2 * Ise * 4));
   p.se_gate = reinterpret_cast<float*>(take((int64_t)kMaxM * 4));
   p.act = reinterpret_cast<half*>(take((int64_t)kMaxM * kTopK * I * 2));
+  {
+    const int64_t need = mono_ffn_rdna2_workspace_bytes(H, R, ND, E, Ise, I);
+    p.stats = workspace.numel() * workspace.element_size() >= need + kStatWords * 8
+                  ? reinterpret_cast<unsigned long long*>(base + need)
+                  : nullptr;
+  }
   p.M = M; p.H = H; p.R = R; p.ND = ND; p.E = E; p.Ise = Ise; p.I = I;
   p.group = group; p.expert_base = (int)expert_base;
   p.zero_offset = (int)zero_offset; p.eps = (float)eps;
@@ -1303,6 +1364,19 @@ torch::Tensor mono_ffn_rdna2_topk(const torch::Tensor& workspace) {
   const int64_t off = offsetof(mono_ffn::Ctrl, topk_id);
   return workspace.slice(0, off, off + 4 * mono_ffn::kMaxPairs)
       .view(torch::kInt32).to(torch::kCPU);
+}
+
+void mono_ffn_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width) {
+  using namespace mono_ffn;
+  TORCH_CHECK(stats.scalar_type() == at::kLong && stats.numel() >= kStatWords,
+              "mono_ffn_mark: int64 stats block");
+  TORCH_CHECK(width >= 0 && width <= kMaxM, "mono_ffn_mark: width");
+  const at::cuda::OptionalCUDAGuard guard(device_of(stats));
+  hipLaunchKernelGGL(mono_mark_kernel, dim3(1), dim3(1), 0,
+                     at::cuda::getCurrentCUDAStream(),
+                     reinterpret_cast<unsigned long long*>(stats.data_ptr()),
+                     (int)kind, (int)width);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 torch::Tensor mono_ffn_rdna2_error(const torch::Tensor& workspace) {
