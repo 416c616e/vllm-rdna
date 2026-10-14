@@ -13,7 +13,8 @@ Two tracks, no MonoKernel in the server.
 Drafter: ROCM_specialist. Sources live in
 [`tools/monokernel-p0-probe/`](../../../tools/monokernel-p0-probe/README.md).
 
-**Not yet compiled; first build on V620 with ROCm 7.14 may need small fixes.**
+Compiled and run on a V620 (ROCm 7.14) on 2026-10-14; results in
+[p0-results.md](p0-results.md).
 
 The probe's grid is 72×256. Dynamic LDS defaults to 65536 minus the
 kernel's static LDS (`hipFuncGetAttributes`), rounded down to 16 bytes.
@@ -30,8 +31,8 @@ probe process under `timeout -s KILL 300`:
 
 Pass/fail reading (busy-first stall with flag-first pass means the protocol
 is fine and the grid was not co-resident; a flag-first stall is a protocol
-or residency bug) is the probe README, not a result. There is no V620 log
-yet **(unverified)**.
+or residency bug) is the probe README, not a result. V620 logs and
+results: [p0-results.md](p0-results.md#p0a--standalone-probe).
 
 ### P0b — Model Runner V2
 
@@ -58,6 +59,11 @@ Answer these from a serve log on dest, not from this page:
    V2 ([#61325](https://github.com/vllm-project/vllm/pull/61325)). If dest
    stays on V1, the hook has to be the V1 capture path. Decide after the
    log, and record it in this file.
+
+   **Decided 2026-10-14:** no V2-specific hook. The FFN kernel is a custom
+   op in the model forward and is captured into the FULL decode graph;
+   production already serves under V2 with FULL widths 3/6/12/24. Answers
+   to 1–5 with the evidence: [p0-results.md](p0-results.md#p0b--model-runner-v2-live-serve).
 
 ## 2a — FFN compute only
 
