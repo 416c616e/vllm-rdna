@@ -24,11 +24,11 @@
       "rocm": "7.15.26333",
       "torch": "2.13.0+rocm10.0.0",
       "lib_sha256": "d05939967b5f1bd184a4b8c1c77509c87a0abae3f0b3d079ba9d68ed1ddc50a5",
-      "rows_per_rank": 44,
+      "rows_per_rank": 128,
       "venv": "v620-vllm-testing (George)",
-      "status": "qualified for build d05939967b5f",
+      "status": "qualified for build d05939967b5f (prefill + decode/MTP grids)",
       "covers": [
-        "Qwen3.8-Flash-Next dense projection shapes (70 TN keys, M=800..8192) on the system rocm/core-10.0 build"
+        "Qwen3.8-Flash-Next dense projection shapes: prefill grid (M=800..8192, 70 TN keys -> 44 curated rows) and decode/MTP grid (M=1..8,12,16,24,32, 84 keys) on the system rocm/core-10.0 build"
       ]
     }
   }

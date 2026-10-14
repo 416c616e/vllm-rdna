@@ -19,12 +19,45 @@ preserved verbatim under `imported` in `provenance.json`.
 | librocblas sha256[:12] | `d05939967b5f` | `f30bb442e9b5` |
 | torch | `2.13.0+gitc1d415f` | `2.12.0+rocm7.14.0` |
 | HIP / ROCm | `7.15.26333` | `7.14.60850` |
-| rows / rank | 44 | 1766 |
-| status | **qualified for `d05939967b5f`** | canonical |
+| rows / rank | 128 | 1766 |
+| status | **qualified for `d05939967b5f`** (prefill + decode/MTP grids) | canonical |
 
 The system copy `/opt/rocm/core-10.0/lib/librocblas.so.5` and the venv copy
 `.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5` are
 **byte-identical** on this box, so both resolve to the same profile.
+
+## Decode / MTP campaign (2026-10-14)
+
+The 2026-10-12 campaign tuned only the prefill grid (M = 800..8192), so **every
+`M <= 32` shape fell back to rocBLAS heuristics on this build** — the canonical
+`../rocm7.14-rocblas5.5/` profile carries the decode (M <= 8) and MTP-verify
+(M = 16/24/32) shapes, this one did not.
+
+Built with the README recipe, service stopped:
+
+```bash
+.venv/bin/python tools/rdna2/tune_v620_fp16.py \
+  --output-root $HOME/.cache/tunableop/campaign-decode \
+  --batch-tokens 1 2 3 4 5 6 7 8 12 16 24 32
+.venv/bin/python tools/rdna2/qualify_v620_fp16.py \
+  $HOME/.cache/tunableop/campaign-decode/rocblas-d05939967b5f
+```
+
+* Tuned on GPU 0 (10 iterations, 10 ms budget per solver, numerics checked against
+  FP32 in-process), then replayed on all four cards against FP32 references.
+* **84/84 keys produced and 84/84 passed on devices 0-3.**
+* Solver mix: 81 `Gemm_Rocblas_*`, 3 `Default` (the heuristic won for
+  `tn_4096_8`, `tn_3584_7`, `tn_3584_8`).
+* **Per-shape speedup over the heuristic: 1.4x to 3.6x.** The largest were the
+  K=320 and K=10240 shapes (up to 3.57x at M=16, n=10240, k=320) — i.e. the
+  decode path was leaving a lot on the table.
+
+Merged into this folder: 44 prefill + 84 decode/MTP = **128 rows/rank**, key sets
+disjoint. Lookup-hit proof re-run on the merged set: **128/128, 0 misses**.
+
+Caveat: these 84 rows are raw tuned, not curated. The prefill campaign's
+adopt/drop margins need a same-session heuristic-vs-current-vs-new comparison,
+which was not run here.
 
 ## Qualification campaign (2026-10-12)
 

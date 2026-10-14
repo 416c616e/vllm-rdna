@@ -6,8 +6,8 @@
   "hip": "7.15.26333",
   "rocblas": "5.6.0.8d1ae90e",
   "rocm": "7.15.26333",
-  "rows_per_rank": 44,
-  "status": "qualified for build d05939967b5f",
+  "rows_per_rank": 128,
+  "status": "qualified for build d05939967b5f (prefill grid + decode/MTP grid)",
   "dtype": "float16",
   "seed": 620,
   "batch_tokens": [
@@ -20,11 +20,23 @@
     3200,
     4000,
     4096,
-    8192
+    8192,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    12,
+    16,
+    24,
+    32
   ],
   "source": "Adapted existing v620-probe-dense-tunable.py",
   "base_rows": "<venv>/cache-prefill-recovery-2026-09-13/qualified/rocblas-c27e2252cc7a",
-  "storage_policy": "Visible sibling profile (not archived). Registered in ../profiles.json; configure_tunableop auto-selects it only when the loaded librocblas.so.5 hashes to c27e2252cc7a, or when TUNABLEOP_PROFILE=rocm10-rocblas5.6 is set (validated against the loaded lib). Only 70 rows/rank for a build that has not been exercised on the fork's serving matrix: treat as thin and schedule its own capture campaign before relying on it.",
+  "storage_policy": "Visible sibling profile (not archived). Registered in ../profiles.json; configure_tunableop auto-selects it when the loaded librocblas.so.5 hashes to d05939967b5f, or when TUNABLEOP_PROFILE=rocm10-rocblas5.6 is set (validated against the loaded lib). 128 rows/rank = the curated prefill grid (44) plus a decode/MTP grid (84) tuned and qualified for this build.",
   "imported": {
     "from": "PR #5 (commit ca83d922a)",
     "by": "Leapdragon/George V620 table",
@@ -41,5 +53,17 @@
     "lookup_hit_proof": "44/44 (verify_lookup_hit.sh, DEVICE=3)",
     "measurement_note": "Same-session repeats agree to ~0.3% median (|d|>3% on 1/70). Across sessions the same row set drifts 5-10%, so adopt/drop margins are only meaningful within one session.",
     "finding": "ours / imported / curated_v2 all measure within 0.9% of each other; all ~4% faster than the heuristic on median."
+  },
+  "campaign_decode": {
+    "when": "2026-10-14",
+    "why": "The prefill-grid campaign left every M <= 32 shape untuned, so on this build all decode and MTP-verify GEMMs fell back to rocBLAS heuristics. The canonical rocm7.14-rocblas5.5 profile carries those shapes; this one did not.",
+    "pipeline": "tools/rdna2/tune_v620_fp16.py (README recipe) then tools/rdna2/qualify_v620_fp16.py",
+    "command": "tune_v620_fp16.py --output-root $HOME/.cache/tunableop/campaign-decode --batch-tokens 1 2 3 4 5 6 7 8 12 16 24 32",
+    "method": "Tuned on GPU 0 (10 iterations, 10 ms budget per solver, numerics checked vs FP32 in-process), then replayed on all four cards against FP32 references.",
+    "rows": "84/84 keys produced, 84/84 passed on devices 0-3",
+    "solver_mix": "81 Gemm_Rocblas_*, 3 Default (the heuristic won for tn_4096_8, tn_3584_7, tn_3584_8)",
+    "speedups": "Per-shape speedup over the heuristic ranged 1.4x to 3.6x; the largest were the K=320 and K=10240 shapes (up to 3.57x at M=16 n=10240 k=320).",
+    "lookup_hit_proof": "128/128 (verify_lookup_hit.sh, DEVICE=3)",
+    "note": "Rows are raw tuned, not curated: the prefill grid's adopt/drop margins need a same-session heuristic-vs-current-vs-new comparison, which was not run here. They cover M values disjoint from the prefill grid, so they only add."
   }
 }
