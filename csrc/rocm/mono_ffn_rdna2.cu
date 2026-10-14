@@ -671,7 +671,6 @@ __global__ void __launch_bounds__(kThreads)
   __shared__ int s_slot[kLocalE];          // local expert -> used slot (-1)
   __shared__ short s_urow[kLocalE * kMaxM];  // pair ids per used expert
   __shared__ int s_nused;
-  __shared__ float s_part[kRowChunk * 128];  // per-WG partial sums (P5b/P6)
   half* const s_seact = s_lora;  // shared-expert activation (P5), M x Ise
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
