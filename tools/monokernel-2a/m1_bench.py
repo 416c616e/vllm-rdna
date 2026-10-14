@@ -39,13 +39,16 @@ def build_ext():
     from torch.utils.cpp_extension import load
 
     os.environ.setdefault("PYTORCH_ROCM_ARCH", "gfx1030")
+    SRC = os.environ.get("MONO_SRC_DIR", os.path.join(TREE, "csrc/rocm"))
     return load(
         name="mono_ffn_ext",
-        sources=[os.path.join(TREE, "csrc/rocm/mono_ffn_rdna2.cu"),
+        sources=[os.path.join(SRC, "mono_ffn_rdna2.cu"),
                  os.path.join(HERE, "ext_binding.cpp")],
-        extra_include_paths=[os.path.join(TREE, "csrc/rocm")],
+        extra_include_paths=[SRC],
         extra_cuda_cflags=["-O3", "--offload-arch=gfx1030", "-ffp-contract=fast",
-                           f"-DMONO_FFN_MIN_BLOCKS={os.environ.get('MONO_MIN_BLOCKS', '1')}"],
+                           f"-DMONO_FFN_MIN_BLOCKS={os.environ.get('MONO_MIN_BLOCKS', '1')}"]
+        + [f"-D{k}={v}" for k, v in os.environ.items() if k.startswith("MONO_FFN_DEF_")
+           for k in [k.replace("MONO_FFN_DEF_", "MONO_FFN_")]],
         build_directory=os.environ.get("MONO_BUILD_DIR"),
         verbose=False,
     )
@@ -114,6 +117,8 @@ def golden(G, res, blk, inj, base, ids=None):
     b = (torch.sigmoid(gate).view(M, HC, H) * xn.view(M, HC, H)).mean(1)
     logits = b @ G["wr"].t()
     p = torch.softmax(logits, -1)
+    srt = logits.sort(-1, descending=True).values
+    golden.last_gap = (srt[:, TOPK - 1] - srt[:, TOPK]).tolist()  # per token
     if ids is None:
         ids = p.topk(TOPK, -1).indices
     w = p.gather(1, ids.long())
@@ -182,7 +187,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--widths", default="3,6,12,24")
     ap.add_argument("--layers", type=int, default=8)
-    ap.add_argument("--wg", type=int, default=72)
+    ap.add_argument("--wg", type=int, default=0, help="0: the residency cap")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--base", type=int, default=0, help="first local expert (EP rank * 128)")
     ap.add_argument("--json", default="")
@@ -217,15 +222,25 @@ def main():
             o_ref, ro_ref, io_ref, ids_ref = ref(L, res, blk, inj)
             o_m, ro_m, io_m = mono(L, res, blk, inj)
             torch.cuda.synchronize()
+            ids_m = ext.topk(ws)[:M * TOPK].view(M, TOPK).to(dev)
             err = ext.error(ws).tolist()
             gold, gro, gio, gids = golden(G, res, blk, inj, a.base)
             gold_r, *_ = golden(G, res, blk, inj, a.base, ids=ids_ref)
+            gold_m, *_ = golden(G, res, blk, inj, a.base, ids=ids_m)
+            diff_m = sum(set(ids_m[m].tolist()) != set(gids[m].tolist()) for m in range(M))
             # the kernel's routing is internal: score it against the golden routing
             diff_ref = sum(set(ids_ref[m].tolist()) != set(gids[m].tolist()) for m in range(M))
+            gaps = golden.last_gap
+            rowerr = (o_m.float() - gold).abs().max(1).values.tolist()
+            bad = [(m, round(rowerr[m], 4), round(gaps[m], 6)) for m in range(M) if rowerr[m] > 0.01]
             row["correctness"][dist] = {
+                "mono_bad_tokens(row, max_abs, gold top10-11 logit gap)": bad,
+                "min_top10_gap": round(min(gaps), 6),
                 "sticky_err": err,
                 "ref_vs_gold(own routing)": stats(o_ref, gold_r),
+                "mono_vs_gold(own routing)": stats(o_m, gold_m),
                 "mono_vs_gold(gold routing)": stats(o_m, gold),
+                "mono_routing_differs_from_gold": f"{diff_m}/{M}",
                 "mono_vs_ref": stats(o_m, o_ref.float()),
                 "res_out mono_vs_ref": stats(ro_m, ro_ref.float()),
                 "inj_out mono_vs_gold": stats(io_m, gio),
@@ -270,6 +285,16 @@ def main():
                 G = int(ext.error(ws).tolist()[3])
                 row["timing"]["mono_phase_us"] = {
                     f"P{i + 1}": round((ts[i + 1] - ts[i]) / 100.0, 1) for i in range(7)}
+                nused = int(ext.error(ws).tolist()[5])
+                ph = row["timing"]["mono_phase_us"]
+                wbytes = {  # weight bytes streamed per phase (per rank)
+                    "P2": ND * HC * H * 2, "P3": HC * H * R * 2,
+                    "P4": (E + 2 * ISE + 1) * H * 2,
+                    "P5": nused * (H // 8) * 2 * I * 4 + H * ISE * 2,
+                    "P6": nused * (I // 8) * H * 4}
+                row["timing"]["local_experts_used"] = nused
+                row["timing"]["mono_phase_GBps"] = {
+                    k: round(v / (ph[k] * 1e-6) / 1e9, 0) for k, v in wbytes.items() if ph[k] > 0}
                 # per phase: earliest / latest WG to finish its work, from phase start
                 row["timing"]["mono_phase_wg_finish_us"] = {
                     f"P{i + 1}": [round((min(done[i * 256:i * 256 + G]) - ts[i]) / 100.0, 1),

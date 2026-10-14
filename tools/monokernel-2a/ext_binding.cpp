@@ -18,10 +18,12 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                     double eps, double timeout_ms);
 torch::Tensor mono_ffn_rdna2_error(const torch::Tensor& workspace);
 torch::Tensor mono_ffn_rdna2_phase_ts(const torch::Tensor& workspace);
+torch::Tensor mono_ffn_rdna2_topk(const torch::Tensor& workspace);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("workspace_bytes", &mono_ffn_rdna2_workspace_bytes);
   m.def("mono_ffn", &mono_ffn_rdna2);
   m.def("error", &mono_ffn_rdna2_error);
   m.def("phase_ts", &mono_ffn_rdna2_phase_ts);
+  m.def("topk", &mono_ffn_rdna2_topk);
 }
