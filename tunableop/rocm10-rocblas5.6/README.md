@@ -19,7 +19,7 @@ preserved verbatim under `imported` in `provenance.json`.
 | librocblas sha256[:12] | `d05939967b5f` | `f30bb442e9b5` |
 | torch | `2.13.0+gitc1d415f` | `2.12.0+rocm7.14.0` |
 | HIP / ROCm | `7.15.26333` | `7.14.60850` |
-| rows / rank | 128 | 1766 |
+| rows / rank | 139 | 1766 |
 | status | **qualified for `d05939967b5f`** (prefill + decode/MTP grids) | canonical |
 
 The system copy `/opt/rocm/core-10.0/lib/librocblas.so.5` and the venv copy
@@ -57,7 +57,62 @@ disjoint. Lookup-hit proof re-run on the merged set: **128/128, 0 misses**.
 
 Caveat: these 84 rows are raw tuned, not curated. The prefill campaign's
 adopt/drop margins need a same-session heuristic-vs-current-vs-new comparison,
-which was not run here.
+which was not run here. **That comparison was run on 2026-10-14** — see the next
+section; the decode grid survives it, but not unexamined.
+
+## Full-grid re-measure (2026-10-14)
+
+`tools/rdna2/check_v620_tuning.py` reported **7 of the 14 shapes the live cache/batch
+config needs as missing**. The live launcher resolves to `--block-size 1024
+--max-num-batched-tokens 2048`, so the chunks that actually run are M = 1024 and 2048:
+`10240x320`, `4096x2560`, `2560x1536`, `3584x2560` (M=1024) and `10240x320`, `512x2560`,
+`10240x2560` (M=2048). Two deliberate mechanisms had kept them missing:
+`tools/rdna2_028/tunableop_rows_pipeline.sh` tunes **only the shapes present in
+`--shape-source`**, so the 26 prefill shapes the 2026-10-12 curation dropped were never
+re-tested; and `curate_tunableop_rows.py` folds `Default` rows into `dropped` by design.
+
+All 168 shapes (7 dense `(N,K)` x 12 prefill M + the 84 decode/MTP rows) were re-tuned and
+then measured heuristic / current / new **in one session** — the 3 % adopt/drop margins are
+meaningless across sessions, where the same rows drift 5-10 %.
+
+**The 7 live-grid holes stay holes.** A fresh tune does not beat the rocBLAS heuristic by
+3 % on any of them, so a row there buys nothing, and an explicit `Default` row would only
+silence the coverage warning while pinning the shape against online tuning. The warning is
+left as-is because it is telling the truth.
+
+**The real gap was one the checker cannot express.** The launcher sets
+`VLLM_RDNA_DYNAMIC_PREFILL=1`, whose chunk-cap ladder is `RUNGS = (256, 512, 1024)` with
+`LPT_SHARED = 512`; `scheduler.py` sets `num_new_tokens = long_prefill_token_threshold`
+whenever more than one request is eligible, so at ≥4 eligible requests a **512-token chunk**
+reaches the GEMMs (256 at 8). There was no row for M = 256/512 at all, and the checker takes
+only `--block-size`/`--max-num-batched-tokens`, so it cannot see that family.
+
+| shape | M | heuristic | tuned row | delta |
+|---|---:|---:|---:|---:|
+| `10240x2560` | 512 | 4.33 ms | **1.22 ms** | −72 % |
+| `336x10240` | 512 | 1.05 ms | **0.24 ms** | −77 % |
+| `10240x2560` | 256 | 2.32 ms | **0.59 ms** | −75 % |
+| `512x2560` | 512 | 0.229 ms | **0.102 ms** | −55 % |
+| `2560x1536` | 512 | 0.243 ms | **0.207 ms** | −15 % |
+| `3584x2560` | 800 | 0.851 ms | **0.728 ms** | −15 % |
+
+The tuned solver reaches ~22 TFLOPS on the large-K shapes where the heuristic manages ~6.
+11 rows were added and 2 shipped prefill rows were replaced by a *different* faster solver
+(`10240x2560` M=1024, `2560x1536` M=3200). Two further "adopt" decisions carried the **same
+solver id** as the shipped row — same-session noise, not a better kernel — and were rejected:
+only adopt when the solver actually changes.
+
+**The decode grid is deliberately left byte-identical.** 18 decode/MTP rows (M=2..8)
+measured 10-77 % slower than the heuristic, which looks damning, but that region is
+launch-bound: identical shape families flip sign between M=1 (row 22-58 % *faster*) and
+M=2..8, on ~14 MFLOP GEMMs timed at 80-240 µs. Deleting them needs a small-M measurement
+(no per-call sync, larger reps) first.
+
+Result: **139 rows/rank** = 55 prefill + 84 decode/MTP. **139/139 matched independent FP32
+on devices 0-3** and **139/139 lookup hits, 0 misses**. Rank files are identical (rank 0's
+validated set); 4-7 keys per rank had picked a different solver in the same-session tune, all
+within noise. Not yet measured: the end-to-end size of the 256/512 win, which only
+materialises in the shared cell and so needs a mixed-load run with ≥4 eligible requests.
 
 ## Qualification campaign (2026-10-12)
 

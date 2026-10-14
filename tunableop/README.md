@@ -13,7 +13,7 @@ one visible folder per rocBLAS build, selected at launch.
 | Profile | rocBLAS | ROCm / torch | `librocblas.so.5` sha256[:12] | rows / rank | Status |
 |---|---|---|---:|---:|---|
 | `rocm7.14-rocblas5.5/` | `5.5.0.cd957402` | `7.14.60850` / `2.12.0+rocm7.14.0` | `f30bb442e9b5` | **1766** | canonical (serving build, `venv-7.14.0_0.28.0`) |
-| `rocm10-rocblas5.6/` | `5.6.0.8d1ae90e` | `7.15.26333` / `2.13.0+rocm10.0.0` | `d05939967b5f` | 44 | **qualified for build `d05939967b5f`** |
+| `rocm10-rocblas5.6/` | `5.6.0.8d1ae90e` | `7.15.26333` / `2.13.0+rocm10.0.0` | `d05939967b5f` | **139** | **qualified for build `d05939967b5f`** (55 prefill + 84 decode/MTP) |
 
 The canonical profile covers all three serving families:
 
@@ -84,6 +84,16 @@ intermediate chunk ends to an 800-token recurrent-state grid. With a 4,096-token
 scheduling budget, ordinary chunks therefore contain 4,000 tokens. Exact-shape
 lookup cannot use 4,096-token rows for these chunks; the table carries the five
 multiples of 800 up to 4,000 (and 1,024/2,048/3,072 for the 1,024 grid).
+
+**The live launcher resolves to `--block-size 1024 --max-num-batched-tokens 2048`**, so the
+chunks that actually run are M = 1,024 and 2,048. It also sets
+`VLLM_RDNA_DYNAMIC_PREFILL=1`, whose chunk-cap ladder is `RUNGS = (256, 512, 1024)` with
+`LPT_SHARED = 512`; the scheduler then sets `num_new_tokens = long_prefill_token_threshold`
+whenever more than one request is eligible, so at ≥4 eligible requests a **512-token** chunk
+reaches the GEMMs (M = 512), and 256 at 8. `check_v620_tuning.py` takes only
+`--block-size`/`--max-num-batched-tokens` and cannot express this, so those rows are carried
+explicitly: M = 256/512 for all seven dense shapes, and they are worth 4x on the large-K
+shapes (10240x2560: 4.33 ms heuristic -> 1.22 ms).
 
 Use `--block-size 1024` with the 4,096-token MTP2 scheduling budget to retain
 4,096-token ordinary chunks. Keep cache-aligned scheduling enabled; disabling it

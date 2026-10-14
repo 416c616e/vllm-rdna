@@ -6,8 +6,8 @@
   "hip": "7.15.26333",
   "rocblas": "5.6.0.8d1ae90e",
   "rocm": "7.15.26333",
-  "rows_per_rank": 128,
-  "status": "qualified for build d05939967b5f (prefill grid + decode/MTP grid)",
+  "rows_per_rank": 139,
+  "status": "qualified for build d05939967b5f (55 prefill + 84 decode/MTP); full-grid re-measure 2026-10-14: 11 rows added at M=256/512/800, 2 solvers replaced, decode grid re-verified against the heuristic",
   "dtype": "float16",
   "seed": 620,
   "batch_tokens": [
@@ -65,5 +65,21 @@
     "speedups": "Per-shape speedup over the heuristic ranged 1.4x to 3.6x; the largest were the K=320 and K=10240 shapes (up to 3.57x at M=16 n=10240 k=320).",
     "lookup_hit_proof": "128/128 (verify_lookup_hit.sh, DEVICE=3)",
     "note": "Rows are raw tuned, not curated: the prefill grid's adopt/drop margins need a same-session heuristic-vs-current-vs-new comparison, which was not run here. They cover M values disjoint from the prefill grid, so they only add."
+  },
+  "campaign_full_grid": {
+    "when": "2026-10-14",
+    "why": "(a) the coverage checker reported 7 of the 14 shapes required by the live cache/batch config (block 1024, max-num-batched-tokens 2048) as missing, and the 26 prefill shapes dropped by the 2026-10-12 curation were never re-tested because the pipeline only tunes shapes present in --shape-source; (b) the live launcher sets VLLM_RDNA_DYNAMIC_PREFILL=1, whose chunk-cap ladder (RUNGS=256,512,1024) can put M=256/512 chunks on the wire at >=4 eligible requests, and no row covered them.",
+    "pipeline": "tools/rdna2_028/tunableop_rows_pipeline.sh PHASE=all, SHAPE_SRC=<our 128 rows | the 40 missing keys> = 168 shapes, PROFILE=rocm10-rocblas5.6",
+    "method": "tuned on all 4 GPUs in parallel (10 iterations, 25 ms budget), then heuristic / current / new measured in ONE session on device 0 (warmup 5, reps 15) so the 3% adopt/drop margins are not compared across sessions.",
+    "findings": {
+      "live_grid_holes": "none of the 7 required-but-missing shapes (M=1024: 10240x320, 4096x2560, 2560x1536, 3584x2560; M=2048: 10240x320, 512x2560, 10240x2560) was beaten by a fresh tune - the rocBLAS heuristic ties or wins on every one, so they stay absent. An explicit `Default` row would only silence the coverage warning without changing behaviour.",
+      "real_wins": "11 new rows at M=256/512/800, all on shapes with no row. The M=256/512 large-K shapes are the big ones: 10240x2560 4.33->1.22 ms (-72%), 336x10240 1.05->0.24 ms (-77%), 512x2560 0.229->0.102 ms (-55%); the new solver reaches ~22 TFLOPS where the heuristic managed ~6.",
+      "solver_replacements": "2 shipped prefill rows were replaced by a different, faster solver (10240x2560 at M=1024, 2560x1536 at M=3200). Two further adopt decisions carried the SAME solver id as the shipped row - i.e. same-session noise, not a better kernel - and were rejected.",
+      "decode_grid_protected": "18 decode/MTP rows (M=2..8) measured 10-77% slower than the heuristic, but that region is launch-bound: identical shape families flip sign between M=1 (row 22-58% faster) and M=2..8, on ~14 MFLOP GEMMs timed at 80-240 us. The decode grid is therefore left byte-identical to what shipped; the 18 need a small-M measurement (no per-call sync, larger reps) before any deletion.",
+      "harness_quirk": "on a key absent from --rows the `current` arm does not reproduce the `heuristic` arm (up to +46% slower), so hole 'drop' verdicts are meaningless. The adopt verdicts are unaffected: they require beating min(current, heuristic)."
+    },
+    "qualification": "qualify_v620_fp16.py: 139/139 rows matched independent FP32 on devices 0-3 (relative L2 < 0.002, assert_close atol/rtol 0.01). Rank files are identical (rank 0's set); 4-7 keys per rank had picked a different solver in the same-session tune, all within noise.",
+    "lookup_hit_proof": "139/139 (verify_lookup_hit.sh, DEVICE=3), 0 misses",
+    "artifacts": "cache/tunableop-rows/{scratch,measure,curated,merged}/ (untracked)"
   }
 }
