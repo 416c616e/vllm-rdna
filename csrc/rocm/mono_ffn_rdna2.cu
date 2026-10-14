@@ -132,6 +132,7 @@ struct Params {
   int M, H, R, ND, E, Ise, I, group, expert_base, zero_offset;
   float eps;
   int prefetch;  // 1: waves 1..7 touch the next phase's weights while waiting
+  int hc_only;   // K1: stop after P3 (block_input written to out via bin)
   unsigned long long timeout_ticks;
   // Optional serve timing (workspace tail, see kStat*): per-width sums of the
   // phase times, the WG entry spread and the launch latency after a mark.
@@ -147,7 +148,8 @@ struct Params {
 //  15 mark -> last entry  16 gaps  17 gap time (previous layer's region end
 //  -> this region's start: the rest of the layer)  18/19 attention spans/time
 //  (HC preamble + attention/GDN + its all-reduce)  20/21 HC preamble
-//  spans/time (attention-side combine + mix). Wall-clock ticks (100 MHz).
+//  spans/time (attention-side combine + mix)  22/23 attention all-reduce
+//  calls/time (RowParallelLinear). Wall-clock ticks (100 MHz).
 // Tuning (0 = default): sleep = s_sleep argument while polling a barrier
 // (1, 2, 4, 8, 16, 32, 64, 127); flags bit 0 = skip the per-WG debug stores.
 constexpr int kStatCols = 24;
@@ -949,6 +951,7 @@ __global__ void __launch_bounds__(kThreads)
           }
         }
     };
+    if (p.hc_only) return;  // K1: kernel end orders the outputs
     if (!grid_barrier(p, 3, &s_flag, pf)) return;
   }
   if (wg == 0 && tid == 0) p.ctrl->ts[3] = wall_clock64();
@@ -1357,12 +1360,17 @@ __global__ void __launch_bounds__(kThreads)
 // region, 2: start of a later layer's region, which also books the gap since
 // the previous region ended, 1: end) and the attention block (3: start,
 // 4: end of the attention-side HC preamble, 5: end after the attention
-// all-reduce).
+// all-reduce) and around RowParallelLinear's all-reduce (6: start, 7: end).
 __global__ void mono_mark_kernel(unsigned long long* stats, int kind, int width) {
   unsigned long long* sc = stats + kStatRows * kStatCols;
   unsigned long long* row = stats + width * kStatCols;
   const unsigned long long t = wall_clock64();
-  if (kind == 3) {
+  if (kind == 6) {
+    sc[8] = t;
+  } else if (kind == 7) {
+    row[22] += 1;
+    row[23] += t - sc[8];
+  } else if (kind == 3) {
     sc[7] = t;
   } else if (kind == 4) {
     row[20] += 1;
@@ -1397,19 +1405,20 @@ int64_t mono_ffn_rdna2_workspace_bytes(int64_t H, int64_t R, int64_t ND,
          al(M * kTopK * 2 * I * 8);
 }
 
-void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
-                    const torch::Tensor& inj, const torch::Tensor& norm_w,
-                    const torch::Tensor& wd, const torch::Tensor& wu,
-                    const torch::Tensor& wr, const torch::Tensor& se_w1,
-                    const torch::Tensor& se_w2, const torch::Tensor& se_wg,
-                    const torch::Tensor& w13, const torch::Tensor& s13,
-                    const torch::Tensor& z13, const torch::Tensor& w2,
-                    const torch::Tensor& s2, const torch::Tensor& z2,
-                    torch::Tensor& res_out, torch::Tensor& inj_out,
-                    torch::Tensor& out, torch::Tensor& workspace,
-                    int64_t expert_base, int64_t zero_offset, int64_t num_wg,
-                    double eps, double timeout_ms) {
+static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
+                        const torch::Tensor& inj, const torch::Tensor& norm_w,
+                        const torch::Tensor& wd, const torch::Tensor& wu,
+                        const torch::Tensor* wr, const torch::Tensor* se_w1,
+                        const torch::Tensor* se_w2, const torch::Tensor* se_wg,
+                        const torch::Tensor* w13, const torch::Tensor* s13,
+                        const torch::Tensor* z13, const torch::Tensor* w2,
+                        const torch::Tensor* s2, const torch::Tensor* z2,
+                        torch::Tensor& res_out, torch::Tensor& inj_out,
+                        torch::Tensor& out, torch::Tensor& workspace,
+                        int64_t expert_base, int64_t zero_offset, int64_t num_wg,
+                        double eps, double timeout_ms) {
   using namespace mono_ffn;
+  const bool hc_only = wr == nullptr;  // K1: HC combine + norm + mix only
   const int M = res.size(0);
   const int HCH = res.size(1);
   const int H = blk.size(1);
@@ -1417,17 +1426,20 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
   TORCH_CHECK(M >= 1 && M <= kMaxM, "mono_ffn: 1 <= M <= 24");
   TORCH_CHECK(res.scalar_type() == at::kHalf && blk.scalar_type() == at::kHalf,
               "mono_ffn: fp16 only");
-  const int ND = wd.size(0), R = wu.size(1), E = wr.size(0);
-  const int Ise = se_w2.size(1), I = w2.size(1) * 8;
-  const int El = w13.size(0);
-  const int groups = s13.size(1);
-  const int group = H / groups;
+  const int ND = wd.size(0), R = wu.size(1);
+  // K1 keeps the FFN's workspace layout (same stats tail as the FFN launches)
+  const int E = hc_only ? 512 : wr->size(0);
+  const int Ise = hc_only ? 160 : se_w2->size(1);
+  const int I = hc_only ? 640 : w2->size(1) * 8;
+  const int group = hc_only ? 128 : H / s13->size(1);
   TORCH_CHECK(R == 320 || R <= 320, "mono_ffn: lora rank <= 320");
-  TORCH_CHECK(E <= 512 && El <= kLocalE, "mono_ffn: E <= 512, local <= 128");
-  TORCH_CHECK(w13.size(2) == 2 * I && w13.size(1) * 8 == H, "mono_ffn: w13 shape");
-  TORCH_CHECK(Ise <= 160 && Ise % 8 == 0, "mono_ffn: shared-expert size");
-  TORCH_CHECK(H % 128 == 0 && I % 64 == 0 && group % 8 == 0,
-              "mono_ffn: alignment");
+  if (!hc_only) {
+    TORCH_CHECK(E <= 512 && w13->size(0) <= kLocalE, "mono_ffn: E <= 512, local <= 128");
+    TORCH_CHECK(w13->size(2) == 2 * I && w13->size(1) * 8 == H, "mono_ffn: w13 shape");
+    TORCH_CHECK(Ise <= 160 && Ise % 8 == 0, "mono_ffn: shared-expert size");
+    TORCH_CHECK(H % 128 == 0 && I % 64 == 0 && group % 8 == 0,
+                "mono_ffn: alignment");
+  }
   TORCH_CHECK(workspace.numel() * workspace.element_size() >=
                   mono_ffn_rdna2_workspace_bytes(H, R, ND, E, Ise, I),
               "mono_ffn: workspace too small");
@@ -1444,16 +1456,19 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
   p.norm_w = reinterpret_cast<const half*>(norm_w.data_ptr());
   p.wd = reinterpret_cast<const half*>(wd.data_ptr());
   p.wu = reinterpret_cast<const half*>(wu.data_ptr());
-  p.wr = reinterpret_cast<const half*>(wr.data_ptr());
-  p.se_w1 = reinterpret_cast<const half*>(se_w1.data_ptr());
-  p.se_w2 = reinterpret_cast<const half*>(se_w2.data_ptr());
-  p.se_wg = reinterpret_cast<const half*>(se_wg.data_ptr());
-  p.w13 = reinterpret_cast<const uint32_t*>(w13.data_ptr());
-  p.s13 = reinterpret_cast<const half*>(s13.data_ptr());
-  p.z13 = reinterpret_cast<const uint32_t*>(z13.data_ptr());
-  p.w2 = reinterpret_cast<const uint32_t*>(w2.data_ptr());
-  p.s2 = reinterpret_cast<const half*>(s2.data_ptr());
-  p.z2 = reinterpret_cast<const uint32_t*>(z2.data_ptr());
+  if (!hc_only) {
+    p.wr = reinterpret_cast<const half*>(wr->data_ptr());
+    p.se_w1 = reinterpret_cast<const half*>(se_w1->data_ptr());
+    p.se_w2 = reinterpret_cast<const half*>(se_w2->data_ptr());
+    p.se_wg = reinterpret_cast<const half*>(se_wg->data_ptr());
+    p.w13 = reinterpret_cast<const uint32_t*>(w13->data_ptr());
+    p.s13 = reinterpret_cast<const half*>(s13->data_ptr());
+    p.z13 = reinterpret_cast<const uint32_t*>(z13->data_ptr());
+    p.w2 = reinterpret_cast<const uint32_t*>(w2->data_ptr());
+    p.s2 = reinterpret_cast<const half*>(s2->data_ptr());
+    p.z2 = reinterpret_cast<const uint32_t*>(z2->data_ptr());
+  }
+  p.hc_only = hc_only ? 1 : 0;
   int64_t off = 0;
   auto take = [&](int64_t bytes) { char* q = base + off; off += al(bytes); return q; };
   p.ctrl = reinterpret_cast<Ctrl*>(take(sizeof(Ctrl)));
@@ -1466,6 +1481,7 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
   p.se_gate = reinterpret_cast<Fx*>(take((int64_t)kMaxM * 8));
   p.act = reinterpret_cast<half*>(take((int64_t)kMaxM * kTopK * I * 2));
   p.gu = reinterpret_cast<Fx*>(take((int64_t)kMaxM * kTopK * 2 * I * 8));
+  if (hc_only) p.bin = reinterpret_cast<half*>(out.data_ptr());  // P3 writes the output
   {
     const int64_t need = mono_ffn_rdna2_workspace_bytes(H, R, ND, E, Ise, I);
     p.stats = workspace.numel() * workspace.element_size() >= need + kStatWords * 8
@@ -1515,6 +1531,36 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
   else
     launch(mono_ffn_kernel<24, MONO_FFN_TILED_BIG ? MONO_FFN_TILED_WPE : 8>, 3);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
+                    const torch::Tensor& inj, const torch::Tensor& norm_w,
+                    const torch::Tensor& wd, const torch::Tensor& wu,
+                    const torch::Tensor& wr, const torch::Tensor& se_w1,
+                    const torch::Tensor& se_w2, const torch::Tensor& se_wg,
+                    const torch::Tensor& w13, const torch::Tensor& s13,
+                    const torch::Tensor& z13, const torch::Tensor& w2,
+                    const torch::Tensor& s2, const torch::Tensor& z2,
+                    torch::Tensor& res_out, torch::Tensor& inj_out,
+                    torch::Tensor& out, torch::Tensor& workspace,
+                    int64_t expert_base, int64_t zero_offset, int64_t num_wg,
+                    double eps, double timeout_ms) {
+  mono_launch(res, blk, inj, norm_w, wd, wu, &wr, &se_w1, &se_w2, &se_wg, &w13, &s13,
+              &z13, &w2, &s2, &z2, res_out, inj_out, out, workspace, expert_base,
+              zero_offset, num_wg, eps, timeout_ms);
+}
+
+// K1: the attention-side HC preamble (combine + grouped norm + down/up mix)
+// with the same persistent kernel, stopped after P3. out = block_input [M, H].
+void mono_hc_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
+                   const torch::Tensor& inj, const torch::Tensor& norm_w,
+                   const torch::Tensor& wd, const torch::Tensor& wu,
+                   torch::Tensor& res_out, torch::Tensor& inj_out,
+                   torch::Tensor& out, torch::Tensor& workspace, int64_t num_wg,
+                   double eps, double timeout_ms) {
+  mono_launch(res, blk, inj, norm_w, wd, wu, nullptr, nullptr, nullptr, nullptr,
+              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out, inj_out,
+              out, workspace, 0, 1, num_wg, eps, timeout_ms);
 }
 
 // Sticky error record of a workspace: [code, phase, wg] (int32, CPU tensor).

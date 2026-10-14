@@ -45,6 +45,9 @@ _MAX_ROWS = 8  # width gate: mono for <= this many rows, today's modules above
 _NUM_WG = 0  # 0: residency cap
 _TUNE = {"sleep": 0, "flags": 0}
 _MODES = {"full", "piecewise", "eager"}
+_HC_ON = False  # K1: attention-side HC preamble on the persistent kernel
+_HC_MAX_ROWS = MAX_ROWS
+_ZEROS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _STAT_COLS = 24
 _STAT_ROWS = MAX_ROWS + 1
 _STAT_WORDS = (_STAT_ROWS + 1) * _STAT_COLS
@@ -57,13 +60,17 @@ def mono_ffn_requested(vllm_config) -> bool:
     extra = getattr(vllm_config, "additional_config", None) or {}
     if not isinstance(extra, dict):
         return False
-    global _MAX_ROWS, _NUM_WG
+    global _MAX_ROWS, _NUM_WG, _HC_ON, _HC_MAX_ROWS
     _TIMING = bool(extra.get("rdna_mono_ffn_timing", False))
     _FORCE_MODULES = bool(extra.get("rdna_mono_ffn_modules", False))
     _MAX_ROWS = min(MAX_ROWS, int(extra.get("rdna_mono_ffn_max_rows", 8)))
     _NUM_WG = int(extra.get("rdna_mono_ffn_num_wg", 0))
     _TUNE["sleep"] = int(extra.get("rdna_mono_ffn_sleep", 0))
     _TUNE["flags"] = int(extra.get("rdna_mono_ffn_flags", 0))
+    _HC_ON = bool(extra.get("rdna_mono_hc", False))
+    _HC_MAX_ROWS = min(MAX_ROWS, int(extra.get("rdna_mono_hc_max_rows", MAX_ROWS)))
+    if _TIMING:
+        _wrap_linear_all_reduce()
     modes = extra.get("rdna_mono_ffn_modes", "full,piecewise,eager")
     _MODES.clear()
     _MODES.update(x.strip() for x in str(modes).split(",") if x.strip())
@@ -122,10 +129,11 @@ def _log_stats():
             logger.info(
                 "rdna_mono_ffn timing dev%d w%d: region n=%d %.1f us | kernel n=%d "
                 "total %.1f phases %s | entry spread %.1f wg0 %.1f | mark->first %.1f "
-                "mark->last %.1f | rest n=%d %.1f us | attn n=%d %.1f us (hc %.1f)",
+                "mark->last %.1f | rest n=%d %.1f us | attn n=%d %.1f us (hc %.1f) | "
+                "linear AR n=%d %.1f us",
                 idx, w, nm, us(r[13], nm), n, us(r[9], n), ph, us(r[8], n),
                 us(r[10], n), us(r[14], n), us(r[15], n), ng, us(r[17], ng),
-                r[18], us(r[19], r[18]), us(r[21], r[20]),
+                r[18], us(r[19], r[18]), us(r[21], r[20]), r[22], us(r[23], r[22]),
             )
 
 
@@ -136,6 +144,7 @@ class MonoFFN:
         self.layer = layer
         self.first = getattr(layer, "layer_idx", None) == 0
         self.ready = False
+        self.hc_ok = False
         self.reason = ""
 
     def setup(self) -> bool:
@@ -206,6 +215,27 @@ class MonoFFN:
         self.base = base
         self.eps = float(hc.config.rms_norm_eps)
         self.ws = _workspace(router.device)
+        # K1: the attention-side HC module, same geometry as the MLP one
+        ahc = layer.attn_hyper_connection
+        adown = ahc.input_mix_weight_down_block_inject
+        aup = ahc.input_mix_weight_up
+        self.hc_ok = (
+            ahc.hc_count == 4
+            and ahc.use_combine
+            and getattr(adown, "weight_i8", None) is None
+            and getattr(aup, "weight_i8", None) is None
+            and adown.weight.shape == down.weight.shape
+            and aup.weight.shape == up.weight.shape
+        )
+        if self.hc_ok:
+            self.th = dict(norm_w=ahc.hc_norm.weight, wd=adown.weight, wu=aup.weight)
+            self.eps_a = float(ahc.config.rms_norm_eps)
+            idx = router.device.index
+            if idx not in _ZEROS:  # (output, injection) for layers with no pending combine
+                _ZEROS[idx] = (
+                    torch.zeros(MAX_ROWS, 2560, dtype=torch.float16, device=router.device),
+                    torch.zeros(MAX_ROWS, 4, dtype=torch.float16, device=router.device),
+                )
 
     def run(self, hidden_states, attn_out, injection):
         t = self.t
@@ -222,8 +252,30 @@ class MonoFFN:
         return res_out, out, inj_out
 
 
+    def run_hc(self, hidden_states, prev_out, prev_inj):
+        """K1: today's attn_hc.combine_and_mix / mix on the persistent kernel."""
+        t = self.th
+        m, hch = hidden_states.shape
+        h = hch // 4
+        if prev_out is None or prev_inj is None:  # mix(): combine with a zero output
+            zo, zi = _ZEROS[hidden_states.device.index]
+            prev_out, prev_inj = zo[:m], zi[:m]
+        res_out = torch.empty_like(hidden_states)
+        inj_out = torch.empty((m, 4), dtype=hidden_states.dtype, device=hidden_states.device)
+        out = torch.empty((m, h), dtype=hidden_states.dtype, device=hidden_states.device)
+        torch.ops._rocm_C.mono_hc_rdna2(
+            hidden_states, prev_out.contiguous(), prev_inj.contiguous(), t["norm_w"],
+            t["wd"], t["wu"], res_out, inj_out, out, self.ws, _NUM_WG, self.eps_a, 2000.0,
+        )
+        return res_out, out, inj_out
+
+
 def timing_enabled() -> bool:
     return _TIMING
+
+
+def hc_enabled() -> bool:
+    return _HC_ON
 
 
 def _mark(kind: int, x: torch.Tensor) -> None:
@@ -240,12 +292,32 @@ def _mono_attn_hc(
     prev_inj: torch.Tensor | None,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Timing only: today's attention-side HC call between marks 3 and 4."""
+    """Attention-side HC preamble: K1 (rdna_mono_hc) when the batch fits, else
+    today's combine_and_mix / mix; timing marks 3 and 4 around it."""
     from vllm.forward_context import get_forward_context
 
-    hc = get_forward_context().no_compile_layers[layer_name].layer.attn_hyper_connection
+    mono = get_forward_context().no_compile_layers[layer_name]
+    hc = mono.layer.attn_hyper_connection
+    m = hidden_states.shape[0]
+    if not torch.cuda.is_current_stream_capturing():
+        mono.setup()
+    mode = _mode()
+    use = (
+        _HC_ON
+        and mono.ready
+        and mono.hc_ok
+        and 0 < m <= _HC_MAX_ROWS
+        and hidden_states.dtype == torch.float16
+        and mode in _MODES
+    )
+    key = ("hc", m, mode, use)
+    if key not in _LOGGED:
+        _LOGGED.add(key)
+        logger.info("rdna_mono_hc: %d rows (%s) -> %s", m, mode, "K1 kernel" if use else "modules")
     _mark(3, hidden_states)
-    if prev_out is not None and prev_inj is not None:
+    if use:
+        out = mono.run_hc(hidden_states, prev_out, prev_inj)
+    elif prev_out is not None and prev_inj is not None:
         out = hc.combine_and_mix(hidden_states, prev_out, prev_inj)
     else:
         out = hc.mix(hidden_states)
@@ -264,6 +336,35 @@ def _mono_attn_hc_fake(hidden_states, prev_out, prev_inj, layer_name):
         hidden_states.new_empty((m, hidden_states.shape[1] // 4)),
         hidden_states.new_empty((m, 4)),
     )
+
+
+def _tmark(x: torch.Tensor, kind: int) -> torch.Tensor:
+    """Timing only: a mark kernel, returned as a copy so compile keeps the op."""
+    _mark(kind, x)
+    return x.clone()
+
+
+def _tmark_fake(x: torch.Tensor, kind: int) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+_WRAPPED = [False]
+
+
+def _wrap_linear_all_reduce() -> None:
+    """Timing only: marks 6/7 around RowParallelLinear's all-reduce (the
+    attention o_proj / GDN out_proj), in both the mono and the module arm."""
+    if _WRAPPED[0]:
+        return
+    _WRAPPED[0] = True
+    import vllm.model_executor.layers.linear as lin
+
+    orig = lin.tensor_model_parallel_all_reduce
+
+    def timed_all_reduce(t):
+        return torch.ops.vllm.rdna_mono_tmark(orig(torch.ops.vllm.rdna_mono_tmark(t, 6)), 7)
+
+    lin.tensor_model_parallel_all_reduce = timed_all_reduce
 
 
 def _mode() -> str:
@@ -350,4 +451,9 @@ direct_register_custom_op(
     op_name="rdna_mono_attn_hc",
     op_func=_mono_attn_hc,
     fake_impl=_mono_attn_hc_fake,
+)
+direct_register_custom_op(
+    op_name="rdna_mono_tmark",
+    op_func=_tmark,
+    fake_impl=_tmark_fake,
 )

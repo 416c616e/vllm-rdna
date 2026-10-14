@@ -70,6 +70,12 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                     double eps, double timeout_ms);
 torch::Tensor mono_ffn_rdna2_error(const torch::Tensor& workspace);
 void mono_ffn_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width);
+void mono_hc_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
+                   const torch::Tensor& inj, const torch::Tensor& norm_w,
+                   const torch::Tensor& wd, const torch::Tensor& wu,
+                   torch::Tensor& res_out, torch::Tensor& inj_out,
+                   torch::Tensor& out, torch::Tensor& workspace, int64_t num_wg,
+                   double eps, double timeout_ms);
 
 std::tuple<at::Tensor, at::Tensor> rdna_hc_mix_prefill(
     const at::Tensor& xn, const at::Tensor& w_down, const at::Tensor& w_up,

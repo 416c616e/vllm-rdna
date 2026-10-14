@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--num-wg", type=int, default=0)
     ap.add_argument("--next-gemms", type=int, default=6)
+    ap.add_argument("--next", default="gemm", choices=["gemm", "small"],
+                    help="small: ~30 distinct small kernels (GDN/attention-like glue)")
     a = ap.parse_args()
     import vllm._custom_ops  # noqa: F401
     ext = B.build_ext()
@@ -86,6 +88,18 @@ def main():
 
         def nextw(i):
             x = xs[i]
+            if a.next == "small":  # many distinct tiny kernels, no bandwidth
+                y = x.float()
+                for _ in range(3):
+                    y = torch.nn.functional.softplus(y) * 0.5
+                    y = torch.sigmoid(y) + y.mean(dim=1, keepdim=True)
+                    y = torch.nn.functional.layer_norm(y, y.shape[1:])
+                    y = torch.tanh(y).cumsum(dim=1) * 1e-3
+                    y = torch.nn.functional.gelu(y).flip(1)
+                    y = torch.exp(-y.abs()).softmax(dim=1)
+                    y = (y - y.amax(dim=1, keepdim=True)).clamp(-4, 4)
+                xs[i].copy_(y.half())
+                return
             for w in nxt[i]:
                 y = torch.nn.functional.linear(x, w)
                 x = torch.nn.functional.silu(torch.cat([y, y], dim=1))

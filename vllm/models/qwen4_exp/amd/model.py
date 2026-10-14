@@ -323,8 +323,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
-        if self._mono_ffn is not None and mono_ffn.timing_enabled():
-            # serve timing only: the same HC call inside an opaque op with marks
+        if self._mono_ffn is not None and (mono_ffn.timing_enabled() or mono_ffn.hc_enabled()):
+            # K1 (rdna_mono_hc) and/or serve timing: the HC call inside an opaque op
             hidden_states, block_input, injection = torch.ops.vllm.rdna_mono_attn_hc(
                 hidden_states, prev_block_output, prev_injection, self._mono_name
             )

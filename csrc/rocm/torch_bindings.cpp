@@ -102,6 +102,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("mono_ffn_rdna2_error", torch::kCUDA, &mono_ffn_rdna2_error);
   rocm_ops.def("mono_ffn_rdna2_mark(Tensor! stats, int kind, int width) -> ()");
   rocm_ops.impl("mono_ffn_rdna2_mark", torch::kCUDA, &mono_ffn_rdna2_mark);
+  rocm_ops.def(
+      "mono_hc_rdna2(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, Tensor wd, "
+      "Tensor wu, Tensor! res_out, Tensor! inj_out, Tensor! out, Tensor! workspace, "
+      "int num_wg, float eps, float timeout_ms) -> ()");
+  rocm_ops.impl("mono_hc_rdna2", torch::kCUDA, &mono_hc_rdna2);
 #endif
   rocm_ops.def(
       "rdna_se_gate_up_silu(Tensor x, Tensor w, Tensor? scale) -> Tensor");
