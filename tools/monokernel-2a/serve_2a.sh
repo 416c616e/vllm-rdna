@@ -17,10 +17,13 @@ export OUT=$RUN/serve-$TAG CACHE=${CACHE:-$RUN/cache-2a-$ARM}
 export VENV=${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.31.0-final}
 export LOAD_HOOK=${LOAD_HOOK:-$HERE/parity_hook.sh}
 # ARM=on-t / off-t: serve timing marks (mono_ffn.py), off-t keeps today's modules.
+# MONO_CFG: extra additional_config keys for the on/off-t arms, e.g.
+#   MONO_CFG='"rdna_mono_ffn_max_rows":8,"rdna_mono_ffn_sleep":8'
+X=${MONO_CFG:+,$MONO_CFG}
 case $ARM in
-    on) AC='{"rdna_mono_ffn":true}' ;;
-    on-t) AC='{"rdna_mono_ffn":true,"rdna_mono_ffn_timing":true}' ;;
-    off-t) AC='{"rdna_mono_ffn":true,"rdna_mono_ffn_timing":true,"rdna_mono_ffn_modules":true}' ;;
+    on) AC="{\"rdna_mono_ffn\":true$X}" ;;
+    on-t) AC="{\"rdna_mono_ffn\":true,\"rdna_mono_ffn_timing\":true$X}" ;;
+    off-t) AC="{\"rdna_mono_ffn\":true,\"rdna_mono_ffn_timing\":true,\"rdna_mono_ffn_modules\":true$X}" ;;
     off) AC= ;;
     *) echo "ARM=on|off|on-t|off-t" >&2; exit 2 ;;
 esac

@@ -21,7 +21,7 @@ def main():
     gen = torch.Generator(device=dev).manual_seed(11)
     L, G = B.make_layer(gen, dev, keep_golden=True)
     nb = int(torch.ops._rocm_C.mono_ffn_rdna2_workspace_bytes(B.H, B.R, B.ND, B.E, B.ISE, B.I))
-    ws = torch.zeros(nb + 4096, dtype=torch.uint8, device=dev)
+    ws = torch.zeros(nb + 8192, dtype=torch.uint8, device=dev)
     ref = B.Reference(0, dev)
     ok = True
 
@@ -82,15 +82,15 @@ def main():
     ok &= nan
     # serve timing stats (workspace tail) + marks
     ws.zero_()
-    st = ws[nb : nb + 26 * 16 * 8].view(torch.int64)
-    st[25 * 16] = -1
-    st[25 * 16 + 3] = 1
+    st = ws[nb : nb + 26 * 24 * 8].view(torch.int64)
+    st[25 * 24] = -1
+    st[25 * 24 + 3] = 1
     for _ in range(3):
         torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 0, 3)
         run(res, blk, inj)
         torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 1, 3)
     torch.cuda.synchronize()
-    r = st.view(26, 16)[3].tolist()
+    r = st.view(26, 24)[3].tolist()
     print("stats w3: launches", r[0], "phases us", [round(v / r[0] / 100, 1) for v in r[1:8]],
           "spread us", round(r[8] / r[0] / 100, 1), "total us", round(r[9] / r[0] / 100, 1),
           "| marks", r[12], "region us", round(r[13] / max(r[12], 1) / 100, 1),

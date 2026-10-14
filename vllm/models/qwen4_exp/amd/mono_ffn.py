@@ -8,20 +8,22 @@ attention all-reduce and the FFN all-reduce: the MLP hyper-connection combine
 + mix, router (fp32 logits and top-k), shared expert and the routed symmetric
 W4A16 experts (``csrc/rocm/mono_ffn_rdna2.cu``). The all-reduce stays outside.
 
-The kernel runs only inside a FULL CUDA graph (pure decode) with at most 24
-rows; prefill, mixed and eager steps, and every unsupported layer, run
-today's modules. The MTP drafter never takes it. The decision is made at run
-time inside one opaque custom op, so torch.compile sees a single op and the
-branch follows the actual batch, not the trace-time size.
+The FFN block is per token, so the kernel is valid for any batch of at most
+``rdna_mono_ffn_max_rows`` rows (<= 24): FULL and PIECEWISE CUDA graph
+captures and eager steps alike (``rdna_mono_ffn_modes``, default all three).
+Larger batches (prefill chunks) and unsupported layers run today's modules;
+the MTP drafter never takes it. The decision is made at run time inside one
+opaque custom op, so torch.compile sees a single op and the branch follows
+the actual batch, not the trace-time size.
 
 Fail-stop: a timed-out grid barrier leaves a sticky record; later launches
 exit at once and fill the FFN output with NaN instead of returning stale data.
 
 Diagnostics (additional_config, off by default): ``rdna_mono_ffn_timing``
-brackets the FFN block + its all-reduce inside FULL graphs with timestamp
+brackets the FFN block + its all-reduce inside captured graphs with timestamp
 kernels and turns on the kernel's per-width phase/entry stats; the per-width
 means are logged on eager steps. ``rdna_mono_ffn_modules`` keeps today's
-modules in FULL graphs too (the switch-off reference with the same marks).
+modules everywhere (the switch-off reference with the same marks).
 """
 
 import time
@@ -39,7 +41,11 @@ _STATS: dict[int, torch.Tensor] = {}
 _LOGGED: set = set()
 _TIMING = False
 _FORCE_MODULES = False
-_STAT_COLS = 16
+_MAX_ROWS = 8  # width gate: mono for <= this many rows, today's modules above
+_NUM_WG = 0  # 0: residency cap
+_TUNE = {"sleep": 0, "flags": 0}
+_MODES = {"full", "piecewise", "eager"}
+_STAT_COLS = 24
 _STAT_ROWS = MAX_ROWS + 1
 _STAT_WORDS = (_STAT_ROWS + 1) * _STAT_COLS
 _TICKS_PER_US = 100.0  # wall_clock64 runs at 100 MHz on V620
@@ -51,8 +57,16 @@ def mono_ffn_requested(vllm_config) -> bool:
     extra = getattr(vllm_config, "additional_config", None) or {}
     if not isinstance(extra, dict):
         return False
+    global _MAX_ROWS, _NUM_WG
     _TIMING = bool(extra.get("rdna_mono_ffn_timing", False))
     _FORCE_MODULES = bool(extra.get("rdna_mono_ffn_modules", False))
+    _MAX_ROWS = min(MAX_ROWS, int(extra.get("rdna_mono_ffn_max_rows", 8)))
+    _NUM_WG = int(extra.get("rdna_mono_ffn_num_wg", 0))
+    _TUNE["sleep"] = int(extra.get("rdna_mono_ffn_sleep", 0))
+    _TUNE["flags"] = int(extra.get("rdna_mono_ffn_flags", 0))
+    modes = extra.get("rdna_mono_ffn_modes", "full,piecewise,eager")
+    _MODES.clear()
+    _MODES.update(x.strip() for x in str(modes).split(",") if x.strip())
     return bool(extra.get("rdna_mono_ffn", False))
 
 
@@ -76,12 +90,16 @@ def _workspace(device: torch.device) -> torch.Tensor:
     ws = _WORKSPACES.get(idx)
     if ws is None:
         nbytes = int(torch.ops._rocm_C.mono_ffn_rdna2_workspace_bytes(2560, 320, 336, 512, 160, 640))
-        ws = torch.zeros(nbytes + 4096, dtype=torch.uint8, device=device)
+        ws = torch.zeros(nbytes + 8192, dtype=torch.uint8, device=device)
         _WORKSPACES[idx] = ws
-        if _TIMING:  # stats block right after the kernel's workspace
-            st = ws[nbytes : nbytes + _STAT_WORDS * 8].view(torch.int64)
-            st[_STAT_ROWS * _STAT_COLS + 0] = -1  # entry_min
-            st[_STAT_ROWS * _STAT_COLS + 3] = 1  # enabled
+        # stats / tuning block right after the kernel's workspace
+        st = ws[nbytes : nbytes + _STAT_WORDS * 8].view(torch.int64)
+        sc = _STAT_ROWS * _STAT_COLS
+        st[sc + 0] = -1  # entry_min
+        st[sc + 5] = _TUNE["sleep"]
+        st[sc + 6] = _TUNE["flags"]
+        if _TIMING:
+            st[sc + 3] = 1  # enabled
             _STATS[idx] = st
     return ws
 
@@ -96,7 +114,7 @@ def _log_stats():
         a = st.view(-1, _STAT_COLS).cpu()
         for w in range(1, _STAT_ROWS):
             r = a[w].tolist()
-            n, nm = r[0], r[12]
+            n, nm, ng = r[0], r[12], r[16]
             if n == 0 and nm == 0:
                 continue
             us = lambda v, k: v / k / _TICKS_PER_US if k else 0.0  # noqa: E731
@@ -104,9 +122,10 @@ def _log_stats():
             logger.info(
                 "rdna_mono_ffn timing dev%d w%d: region n=%d %.1f us | kernel n=%d "
                 "total %.1f phases %s | entry spread %.1f wg0 %.1f | mark->first %.1f "
-                "mark->last %.1f",
+                "mark->last %.1f | rest n=%d %.1f us | attn n=%d %.1f us (hc %.1f)",
                 idx, w, nm, us(r[13], nm), n, us(r[9], n), ph, us(r[8], n),
-                us(r[10], n), us(r[14], n), us(r[15], n),
+                us(r[10], n), us(r[14], n), us(r[15], n), ng, us(r[17], ng),
+                r[18], us(r[19], r[18]), us(r[21], r[20]),
             )
 
 
@@ -115,6 +134,7 @@ class MonoFFN:
 
     def __init__(self, layer: torch.nn.Module):
         self.layer = layer
+        self.first = getattr(layer, "layer_idx", None) == 0
         self.ready = False
         self.reason = ""
 
@@ -197,26 +217,73 @@ class MonoFFN:
             hidden_states, attn_out, injection.contiguous(), t["norm_w"], t["wd"],
             t["wu"], t["wr"], t["se_w1"], t["se_w2"], t["se_wg"], t["w13"], t["s13"],
             t["z13"], t["w2"], t["s2"], t["z2"], res_out, inj_out, out, self.ws,
-            self.base, 1, 0, self.eps, 2000.0,
+            self.base, 1, _NUM_WG, self.eps, 2000.0,
         )
         return res_out, out, inj_out
 
 
-def _in_full_graph() -> bool:
-    """True while a FULL (pure decode) CUDA graph is being captured.
+def timing_enabled() -> bool:
+    return _TIMING
+
+
+def _mark(kind: int, x: torch.Tensor) -> None:
+    """Serve timing mark (see mono_mark_kernel); FULL-graph capture only."""
+    m = x.shape[0]
+    st = _STATS.get(x.device.index)
+    if st is not None and 0 < m <= MAX_ROWS and _mode() != "eager":
+        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, kind, m)
+
+
+def _mono_attn_hc(
+    hidden_states: torch.Tensor,
+    prev_out: torch.Tensor | None,
+    prev_inj: torch.Tensor | None,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Timing only: today's attention-side HC call between marks 3 and 4."""
+    from vllm.forward_context import get_forward_context
+
+    hc = get_forward_context().no_compile_layers[layer_name].layer.attn_hyper_connection
+    _mark(3, hidden_states)
+    if prev_out is not None and prev_inj is not None:
+        out = hc.combine_and_mix(hidden_states, prev_out, prev_inj)
+    else:
+        out = hc.mix(hidden_states)
+    _mark(4, hidden_states)
+    # a custom op may not return its inputs (mix() hands back hidden_states)
+    ins = [t for t in (hidden_states, prev_out, prev_inj) if t is not None]
+    return tuple(
+        o.clone() if any(o.data_ptr() == t.data_ptr() for t in ins) else o for o in out
+    )
+
+
+def _mono_attn_hc_fake(hidden_states, prev_out, prev_inj, layer_name):
+    m = hidden_states.shape[0]
+    return (
+        torch.empty_like(hidden_states),
+        hidden_states.new_empty((m, hidden_states.shape[1] // 4)),
+        hidden_states.new_empty((m, 4)),
+    )
+
+
+def _mode() -> str:
+    """"full", "piecewise" or "eager" for the current call.
 
     Model Runner V2 captures FULL graphs by running the model with
     cudagraph_runtime_mode NONE inside torch.cuda.graph; PIECEWISE capture runs
-    with mode PIECEWISE. Eager steps are not capturing. FULL replays do not
-    re-enter Python, so the capture-time choice is what replays."""
+    with mode PIECEWISE. Graph replays do not re-enter Python, so the
+    capture-time choice is what replays."""
     from vllm.config import CUDAGraphMode
     from vllm.forward_context import get_forward_context, is_forward_context_available
 
     if not torch.cuda.is_current_stream_capturing():
-        return False
-    if not is_forward_context_available():
-        return False
-    return get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+        return "eager"
+    if (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+    ):
+        return "piecewise"
+    return "full"
 
 
 def _mono_ffn_block(
@@ -234,22 +301,22 @@ def _mono_ffn_block(
         # Resolve weights / allocate the workspace on an eager step (profile
         # and warmup runs precede capture); nothing here may run in a capture.
         mono.setup()
-    full = (
-        0 < m <= MAX_ROWS
-        and hidden_states.dtype == torch.float16
-        and mono.ready
-        and _in_full_graph()
-    )
-    use = full and not _FORCE_MODULES
-    key = (m, use)
+    mode = _mode()
+    fits = 0 < m <= MAX_ROWS and hidden_states.dtype == torch.float16 and mono.ready
+    use = fits and not _FORCE_MODULES and m <= _MAX_ROWS and mode in _MODES
+    key = (m, mode, use)
     if key not in _LOGGED:
         _LOGGED.add(key)
-        logger.info("rdna_mono_ffn: %d rows -> %s", m, "mono kernel" if use else "modules")
-    st = _STATS.get(hidden_states.device.index) if (_TIMING and full) else None
+        logger.info(
+            "rdna_mono_ffn: %d rows (%s) -> %s", m, mode, "mono kernel" if use else "modules"
+        )
+    timed = _TIMING and fits and mode != "eager"
+    st = _STATS.get(hidden_states.device.index) if timed else None
     if _TIMING and not torch.cuda.is_current_stream_capturing():
         _log_stats()
     if st is not None:
-        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 0, m)
+        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 5, m)  # attention block done
+        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 0 if mono.first else 2, m)
     if use:
         from vllm.distributed import tensor_model_parallel_all_reduce
 
@@ -278,4 +345,9 @@ direct_register_custom_op(
     op_name="rdna_mono_ffn_block",
     op_func=_mono_ffn_block,
     fake_impl=_mono_ffn_block_fake,
+)
+direct_register_custom_op(
+    op_name="rdna_mono_attn_hc",
+    op_func=_mono_attn_hc,
+    fake_impl=_mono_attn_hc_fake,
 )

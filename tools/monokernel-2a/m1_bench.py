@@ -248,9 +248,10 @@ def main():
                 "ref_routing_differs_from_gold": f"{diff_ref}/{M}",
             }
         # timing: one graph over all layers
-        ins = [((torch.randn(M, HC * H, device=dev)).half(),
-                (torch.randn(M, H, device=dev)).half(),
-                torch.randn(M, HC, device=dev).half()) for _ in layers]
+        gt = torch.Generator(device=dev).manual_seed(4321 + M)  # same routing per variant
+        ins = [((torch.randn(M, HC * H, generator=gt, device=dev)).half(),
+                (torch.randn(M, H, generator=gt, device=dev)).half(),
+                torch.randn(M, HC, generator=gt, device=dev).half()) for _ in layers]
         for name, fn in (("today_block", lambda L, x: ref(L, *x)),
                          ("mono_kernel", lambda L, x: mono(L, *x))):
             for (L, _), x in zip(layers, ins):
