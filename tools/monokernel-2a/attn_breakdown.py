@@ -51,7 +51,7 @@ FFN_RE = re.compile(r"moe_gemm|fused_moe|topkGating|se_gate_up|se_down", re.I)
 QSA_RE = re.compile(r"qsa|fa_rdna2|mqa|paged_attention|top_k_per_row", re.I)
 
 
-def segment_report(steps, show_seq):
+def segment_report(steps, show_seq, classes=("attn_gdn", "attn_qsa")):
     """Split each step at its all-reduce kernels. A segment holding MoE /
     shared-expert kernels is the FFN block between the attention all-reduce and
     the FFN all-reduce (what a 2a FFN kernel replaces: HC combine+norm, router,
@@ -109,7 +109,7 @@ def segment_report(steps, show_seq):
     common = sorted(samples.items(), key=lambda kv: -len(kv[1]))
     shown = set()
     for (cls, n), occ in common:
-        if cls not in ("attn_gdn", "attn_qsa") or any(c == cls for c, _ in shown):
+        if cls not in classes or any(c == cls for c, _ in shown):
             continue
         shown.add((cls, n))
         tot_us = statistics.median(sum(k.get("dur", 0) for k in ks) for ks in occ)
@@ -130,6 +130,8 @@ def main():
     ap.add_argument("--show-seq", action="store_true",
                     help="print the classified segment sequence of one step")
     ap.add_argument("--top", type=int, default=60)
+    ap.add_argument("--classes", default="attn_gdn,attn_qsa",
+                    help="segment classes to list kernel by kernel (also: ffn)")
     a = ap.parse_args()
     op = gzip.open if a.trace.endswith(".gz") else open
     with op(a.trace, "rt") as f:
@@ -196,7 +198,7 @@ def main():
         if len(g) < 3:
             continue
         print(f"\n######## decode width {toks} ({len(g)} steps)")
-        segment_report(g, False)
+        segment_report(g, False, tuple(a.classes.split(",")))
     for label, sel in (("decode-only steps", dec),):
         if not sel:
             continue
