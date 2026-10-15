@@ -97,8 +97,17 @@ def _workspace(device: torch.device) -> torch.Tensor:
     ws = _WORKSPACES.get(idx)
     if ws is None:
         nbytes = int(torch.ops._rocm_C.mono_ffn_rdna2_workspace_bytes(2560, 320, 336, 512, 160, 640))
-        ws = torch.zeros(nbytes + 8192, dtype=torch.uint8, device=device)
+        # explicit coarse-grained allocation, not the caching allocator (whose
+        # blocks can be fine-grained under HSA_FORCE_FINE_GRAIN_PCIE=1)
+        ws = torch.ops._rocm_C.mono_ffn_rdna2_workspace_alloc(nbytes + 8192, idx)
         _WORKSPACES[idx] = ws
+        probe = torch.empty(1, dtype=torch.uint8, device=device)
+        logger.info(
+            "rdna_mono_ffn: workspace %d B on cuda:%d, HSA global flags %d "
+            "(caching allocator: %d; 2 fine, 4 coarse, 8 extended fine)",
+            nbytes + 8192, idx, torch.ops._rocm_C.mono_ffn_rdna2_mem_flags(ws),
+            torch.ops._rocm_C.mono_ffn_rdna2_mem_flags(probe),
+        )
         # stats / tuning block right after the kernel's workspace
         st = ws[nbytes : nbytes + _STAT_WORDS * 8].view(torch.int64)
         sc = _STAT_ROWS * _STAT_COLS

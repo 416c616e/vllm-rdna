@@ -45,8 +45,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <dlfcn.h>
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hsa/hsa_ext_amd.h>
 
 #include "q_gemm_rdna2_common.cuh"
 #include "qdq_4_rdna2.cuh"
@@ -61,6 +64,14 @@ constexpr int kMaxPairs = kMaxM * kTopK;
 constexpr int kLocalE = 128;
 constexpr int kHC = 4;
 constexpr int kRowChunk = 8;
+// E1 GDN decode (Qwen4Exp linear-attention layers, per TP rank).
+constexpr int kGdnH = 4, kGdnHV = 12, kGdnK = 128, kGdnV = 128;
+constexpr int kGdnQK = 2 * kGdnH * kGdnK;           // 1024 conv channels of q|k
+constexpr int kGdnCD = kGdnQK + kGdnHV * kGdnV;     // 2560 conv channels (q|k|v)
+constexpr int kGdnNQ = kGdnCD + kGdnHV * kGdnV;     // 4096 in_proj_qkvz rows
+constexpr int kGdnNB = 2 * kGdnHV;                  // 24 in_proj_ba rows (b|a)
+constexpr int kGdnNI = kGdnNQ + kGdnNB;             // 4120 projected columns
+constexpr int kGdnVD = kGdnHV * kGdnV;              // 1536 out_proj inputs
 
 struct Ctrl {
   unsigned count;  // barrier arrivals
@@ -73,6 +84,7 @@ struct Ctrl {
   unsigned long long wg_done[10][256];  // per-WG end of phase work (debug); 7-9: P5 sub-steps
   int topk_id[kMaxPairs];              // WG0's routing of the last launch
   float topw[kMaxPairs];               // grid top-k weights (M > GTOPK_MIN)
+  int gwork[4];                        // dynamic row counters (GDN GEMVs), reset in P1
 };
 
 // Cross-WG fp32 reductions use 64-bit fixed point (2^-32 resolution, |v| < 2^31):
@@ -133,6 +145,27 @@ struct Params {
   float eps;
   int prefetch;  // 1: waves 1..7 touch the next phase's weights while waiting
   int hc_only;   // K1: stop after P3 (block_input written to out via bin)
+  // E1 GDN mode: K1, then the linear-attention decode of the layer.
+  int gdn;
+  const half* g_wq;     // in_proj_qkvz [4096, H]
+  const half* g_wba;    // in_proj_ba [24, H]
+  const half* g_convw;  // conv1d [2560, 4]
+  const half* g_convb;  // [2560] or null
+  half* g_convs;        // conv state (slot, channel, 3) via strides, in place
+  long g_cs_slot, g_cs_dim, g_cs_t;
+  float* g_ssm;         // [slots, 12, 128 (V), 128 (K)] fp32, in place
+  long g_ss_slot;
+  int g_slots;
+  const float* g_alog;  // [12]
+  const float* g_dtb;   // [12]
+  const half* g_normw;  // gated RMSNorm weight [128]
+  const half* g_wo;     // out_proj [H, 1536]
+  const int* g_sidx;    // state slot per row [M]
+  float g_scale, g_eps;
+  int g_sig;            // gate: 0 silu(z), 1 sigmoid(z)
+  Fx* g_q;              // [M, 4120] projected q|k|v|z|b|a sums
+  half* g_y;            // [M, 1536] gated-norm output
+  half* g_st;           // [M, 1024, 3] new q|k conv state (deferred write)
   unsigned long long timeout_ticks;
   // Optional serve timing (workspace tail, see kStat*): per-width sums of the
   // phase times, the WG entry spread and the launch latency after a mark.
@@ -376,6 +409,49 @@ __device__ __forceinline__ void row_dot(const half* __restrict__ w,
             a = __builtin_amdgcn_fdot2(wh[2], xh[2], a, false);
             a = __builtin_amdgcn_fdot2(wh[3], xh[3], a, false);
             acc[m] = a;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Two weight rows per wave (w0, w0 + K): twice the weight loads in flight per
+// lane, and every activation load serves both rows. acc[0][m], acc[1][m].
+template <int MT>
+__device__ __forceinline__ void row_dot2(const half* __restrict__ w,
+                                         const half* __restrict__ x, int ldx, int K,
+                                         int M, int k8_lo, int k8_hi, int lane,
+                                         float (&acc)[2][MT]) {
+  const uint4* w0 = reinterpret_cast<const uint4*>(w);
+  const uint4* w1 = reinterpret_cast<const uint4*>(w + K);
+  for (int i = k8_lo + lane; i < k8_hi; i += 32 * 4) {
+    uint4 wa[4], wb[4];
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int idx = i + 32 * u;
+      wa[u] = idx < k8_hi ? w0[idx] : make_uint4(0, 0, 0, 0);
+      wb[u] = idx < k8_hi ? w1[idx] : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int idx = i + 32 * u;
+      if (idx < k8_hi) {
+        const half2* ha = reinterpret_cast<const half2*>(&wa[u]);
+        const half2* hb = reinterpret_cast<const half2*>(&wb[u]);
+#pragma unroll
+        for (int m = 0; m < MT; m++) {
+          if (m < M) {
+            const uint4 xq = reinterpret_cast<const uint4*>(x + (size_t)m * ldx)[idx];
+            const half2* xh = reinterpret_cast<const half2*>(&xq);
+            float a0 = acc[0][m], a1 = acc[1][m];
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+              a0 = __builtin_amdgcn_fdot2(ha[q], xh[q], a0, false);
+              a1 = __builtin_amdgcn_fdot2(hb[q], xh[q], a1, false);
+            }
+            acc[0][m] = a0;
+            acc[1][m] = a1;
           }
         }
       }
@@ -708,6 +784,7 @@ __global__ void __launch_bounds__(kThreads)
   for (int i = wg * kThreads + tid; i < M * p.E; i += G * kThreads) p.logits[i] = 0.f;
   for (int i = wg * kThreads + tid; i < M * 2 * p.Ise; i += G * kThreads) p.se_g[i] = 0.f;
   for (int i = wg * kThreads + tid; i < M; i += G * kThreads) p.se_gate[i] = 0.f;
+  if (p.gdn && wg == 0 && tid < 4) p.ctrl->gwork[tid] = 0;
   for (int item = wg; item < M * kHC; item += G) {
     const int m = item / kHC, c = item % kHC;
     const float injc = 2.f * sigmoid_f(__half2float(p.inj[m * kHC + c]) / kHC);
@@ -960,6 +1037,175 @@ __global__ void __launch_bounds__(kThreads)
     if (!grid_barrier(p, 3, &s_flag, pf)) return;
   }
   if (wg == 0 && tid == 0) p.ctrl->ts[3] = wall_clock64();
+
+  if (p.gdn) {
+    // fp16 GEMV out[m, col0 + n] = W[n, :] . X[m, :]: two output rows per wave
+    // over the whole K, all M rows in one pass (row_dot2).
+    auto gemv_fx = [&](const half* W, int NRows, int K, const half* X, Fx* out, int ldo,
+                       int col0, int ctr) {
+      const int K8 = K / 8;
+      (void)ctr;
+      for (int r = 2 * gw; r < NRows; r += 2 * GW) {  // NRows is even
+        float a[2][MT];
+#pragma unroll
+        for (int m = 0; m < MT; m++) a[0][m] = a[1][m] = 0.f;
+        row_dot2<MT>(W + (size_t)r * K, X, K, K, M, 0, K8, lane, a);
+        wave_sum<MT>(a[0]);
+        wave_sum<MT>(a[1]);
+        if (lane == 0) {
+#pragma unroll
+          for (int m = 0; m < MT; m++)
+            if (m < M) {
+              out[(size_t)m * ldo + col0 + r] = a[0][m];
+              out[(size_t)m * ldo + col0 + r + 1] = a[1][m];
+            }
+        }
+      }
+    };
+    // ---------------- P4g: in_proj_qkvz | in_proj_ba from block_input
+    gemv_fx(p.g_wq, kGdnNQ, H, p.bin, p.g_q, kGdnNI, 0, 0);
+    gemv_fx(p.g_wba, kGdnNB, H, p.bin, p.g_q, kGdnNI, kGdnNQ, 1);
+    if (!grid_barrier(p, 4, &s_flag)) return;
+    if (wg == 0 && tid == 0) p.ctrl->ts[4] = wall_clock64();
+
+    // ---------------- P5g: one WG per (row, value head): causal conv update of
+    // the head's q|k|v channels, the gated delta-rule update of its fp32 state
+    // (gdn_decode_rdna2's math, 4 tiles of 32 v rows x 8 k slices), gated
+    // RMSNorm. Reference rounding: projections, conv output, state readout and
+    // norm output in fp16.
+    {
+      float* sf = reinterpret_cast<float*>(s_lora);  // q[128] k[128] v[128] o[128]
+      float* sq = sf;
+      float* sk = sf + 128;
+      float* sv = sf + 256;
+      float* so = sf + 384;
+      constexpr int REP = kGdnHV / kGdnH;
+      const auto hv16 = [&](int m, int c) {  // projected value, fp16-rounded
+        return __half2float(__float2half((float)p.g_q[(size_t)m * kGdnNI + c]));
+      };
+      for (int t = wg; t < M * kGdnHV; t += G) {
+        const int m = t / kGdnHV, hv = t % kGdnHV, h = hv / REP;
+        const long slot = p.g_sidx[m];
+        if (slot <= 0 || slot >= p.g_slots) {  // null / padded row: zero, no state
+          for (int i = tid; i < kGdnV; i += kThreads)
+            p.g_y[(size_t)m * kGdnVD + hv * kGdnV + i] = __float2half(0.f);
+          continue;
+        }
+        for (int i = tid; i < 3 * 128; i += kThreads) {
+          const int seg = i / 128, j = i % 128;
+          const int ch = seg == 0 ? h * kGdnK + j
+                         : seg == 1 ? kGdnH * kGdnK + h * kGdnK + j
+                                    : kGdnQK + hv * kGdnV + j;
+          half* cs = p.g_convs + slot * p.g_cs_slot + (long)ch * p.g_cs_dim;
+          const float s0 = __half2float(cs[0]);
+          const float s1 = __half2float(cs[p.g_cs_t]);
+          const float s2 = __half2float(cs[2 * p.g_cs_t]);
+          const float x = hv16(m, ch);
+          const half* w = p.g_convw + (size_t)ch * 4;
+          float acc = __half2float(w[0]) * s0 + __half2float(w[1]) * s1 +
+                      __half2float(w[2]) * s2 + __half2float(w[3]) * x;
+          if (p.g_convb != nullptr) acc += __half2float(p.g_convb[ch]);
+          const float y = __half2float(__float2half(silu_f(acc)));
+          sf[seg * 128 + j] = y;
+          if (seg == 2) {  // v channels belong to this head only
+            cs[0] = __float2half(s1);
+            cs[p.g_cs_t] = __float2half(s2);
+            cs[2 * p.g_cs_t] = __float2half(x);
+          } else if (hv % REP == 0) {  // q|k shared by REP heads: written in P6g
+            half* st = p.g_st + ((size_t)m * kGdnQK + ch) * 3;
+            st[0] = __float2half(s1);
+            st[1] = __float2half(s2);
+            st[2] = __float2half(x);
+          }
+        }
+        __syncthreads();
+        const int v_local = tid >> 3, ks = tid & 7, k0 = ks * 16;
+        float q[16], kk[16];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          q[j] = sq[k0 + j];
+          kk[j] = sk[k0 + j];
+        }
+        float nq = 0.f, nk = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          nq += q[j] * q[j];
+          nk += kk[j] * kk[j];
+        }
+        for (int off = 1; off <= 4; off <<= 1) {
+          nq += __shfl_xor(nq, off);
+          nk += __shfl_xor(nk, off);
+        }
+        const float q_scale = p.g_scale / sqrtf(nq + 1e-6f);
+        const float k_scale = 1.0f / sqrtf(nk + 1e-6f);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          q[j] *= q_scale;
+          kk[j] *= k_scale;
+        }
+        const float a_val = hv16(m, kGdnNQ + kGdnHV + hv);
+        const float b_val = hv16(m, kGdnNQ + hv);
+        const float xg = a_val + p.g_dtb[hv];
+        const float softplus = xg <= 20.f ? logf(1.f + expf(xg)) : xg;
+        const float decay = expf(-expf(p.g_alog[hv]) * softplus);
+        const float beta = __half2float(__float2half(1.f / (1.f + expf(-b_val))));
+        for (int it = 0; it < kGdnV / 32; it++) {
+          const int o_v = it * 32 + v_local;
+          float* ph = p.g_ssm + slot * p.g_ss_slot + ((long)hv * kGdnV + o_v) * kGdnK + k0;
+          float hs[16];
+#pragma unroll
+          for (int j = 0; j < 16; ++j) hs[j] = ph[j] * decay;
+          float acc = 0.f;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) acc += hs[j] * kk[j];
+          for (int off = 1; off <= 4; off <<= 1) acc += __shfl_xor(acc, off);
+          const float v2 = (sv[o_v] - acc) * beta;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) hs[j] += v2 * kk[j];
+          float oa = 0.f;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) oa += hs[j] * q[j];
+          for (int off = 1; off <= 4; off <<= 1) oa += __shfl_xor(oa, off);
+#pragma unroll
+          for (int j = 0; j < 16; ++j) ph[j] = hs[j];
+          if (ks == 0) so[o_v] = __half2float(__float2half(oa));
+        }
+        __syncthreads();
+        // gated RMSNorm over the head (norm before gate)
+        float ss = 0.f;
+        for (int i = tid; i < kGdnV; i += kThreads) ss += so[i] * so[i];
+        for (int off = 16; off >= 1; off >>= 1) ss += __shfl_xor(ss, off);
+        if (lane == 0) s_red[wave] = ss;
+        __syncthreads();
+        float tot = 0.f;
+#pragma unroll
+        for (int w8 = 0; w8 < kWaves; w8++) tot += s_red[w8];
+        const float rstd = rsqrtf(tot / kGdnV + p.g_eps);
+        for (int i = tid; i < kGdnV; i += kThreads) {
+          const float zv = hv16(m, kGdnCD + hv * kGdnV + i);
+          const float sg = 1.f / (1.f + expf(-zv));
+          const float gate = p.g_sig ? sg : zv * sg;
+          p.g_y[(size_t)m * kGdnVD + hv * kGdnV + i] =
+              __float2half(so[i] * rstd * __half2float(p.g_normw[i]) * gate);
+        }
+        __syncthreads();
+      }
+    }
+    if (!grid_barrier(p, 5, &s_flag)) return;
+    if (wg == 0 && tid == 0) p.ctrl->ts[5] = wall_clock64();
+
+    // ---------------- P6g: out_proj (rank partial) + deferred q|k conv state
+    gemv_fx(p.g_wo, H, kGdnVD, p.g_y, p.acc, H, 0, 2);
+    for (int i = wg * kThreads + tid; i < M * kGdnQK * 3; i += G * kThreads) {
+      const int m = i / (kGdnQK * 3), r = i % (kGdnQK * 3), ch = r / 3, j = r % 3;
+      const long slot = p.g_sidx[m];
+      if (slot <= 0 || slot >= p.g_slots) continue;
+      p.g_convs[slot * p.g_cs_slot + (long)ch * p.g_cs_dim + j * p.g_cs_t] =
+          p.g_st[i];
+    }
+    if (!grid_barrier(p, 6, &s_flag)) return;
+    if (wg == 0 && tid == 0) p.ctrl->ts[6] = wall_clock64();
+  } else {
 
   // ---------------- P4: router (fp32 logits), shared-expert gate_up, expert
   // gate; K split, fp32 atomics.
@@ -1333,7 +1579,9 @@ __global__ void __launch_bounds__(kThreads)
   if (!grid_barrier(p, 6, &s_flag)) return;
   if (wg == 0 && tid == 0) p.ctrl->ts[6] = wall_clock64();
 
-  // ---------------- P7: out = fp16(shared + routed)
+  }  // FFN path
+
+  // ---------------- P7: out = fp16(shared + routed) (GDN: out_proj partial)
   for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
     p.out[i] = __float2half(p.acc[i]);
   if (wg == 0 && tid == 0) {
@@ -1349,7 +1597,7 @@ __global__ void __launch_bounds__(kThreads)
       for (int i = 1; i < 8; i++) row[i] += ts[i] - ts[i - 1];
       row[8] += emax - emin;
       row[9] += ts[7] - emin;
-      {  // routing load of this rank vs kernel duration
+      if (!p.gdn) {  // routing load of this rank vs kernel duration
         unsigned long long lp = 0;
         for (int u = 0; u < s_nused; u++) lp += s_ucnt[u];
         const unsigned long long d = ts[7] - emin;
@@ -1433,8 +1681,17 @@ int64_t mono_ffn_rdna2_workspace_bytes(int64_t H, int64_t R, int64_t ND,
   return al(sizeof(Ctrl)) + al(M * ND * 8) + al(M * H * 8) +
          al(M * kHC * H * 2) + al(M * H * 2) + al(M * E * 8) +
          al(M * 2 * Ise * 8) + al(M * 8) + al(M * kTopK * I * 2) +
-         al(M * kTopK * 2 * I * 8);
+         al(M * kTopK * 2 * I * 8) + al(M * kGdnNI * 8) + al(M * kGdnVD * 2) +
+         al(M * kGdnQK * 3 * 2);
 }
+
+struct GdnArgs {
+  const torch::Tensor *wq, *wba, *convw, *convb, *normw, *wo, *sidx;
+  torch::Tensor *conv_state, *ssm_state;
+  const torch::Tensor *alog, *dtb;
+  double scale, eps;
+  int64_t sigmoid;
+};
 
 static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
                         const torch::Tensor& inj, const torch::Tensor& norm_w,
@@ -1447,9 +1704,9 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
                         torch::Tensor& res_out, torch::Tensor& inj_out,
                         torch::Tensor& out, torch::Tensor& workspace,
                         int64_t expert_base, int64_t zero_offset, int64_t num_wg,
-                        double eps, double timeout_ms) {
+                        double eps, double timeout_ms, const GdnArgs* gdn = nullptr) {
   using namespace mono_ffn;
-  const bool hc_only = wr == nullptr;  // K1: HC combine + norm + mix only
+  const bool hc_only = wr == nullptr && gdn == nullptr;  // K1 only
   const int M = res.size(0);
   const int HCH = res.size(1);
   const int H = blk.size(1);
@@ -1459,12 +1716,13 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
               "mono_ffn: fp16 only");
   const int ND = wd.size(0), R = wu.size(1);
   // K1 keeps the FFN's workspace layout (same stats tail as the FFN launches)
-  const int E = hc_only ? 512 : wr->size(0);
-  const int Ise = hc_only ? 160 : se_w2->size(1);
-  const int I = hc_only ? 640 : w2->size(1) * 8;
-  const int group = hc_only ? 128 : H / s13->size(1);
+  const bool ffn = wr != nullptr;
+  const int E = !ffn ? 512 : wr->size(0);
+  const int Ise = !ffn ? 160 : se_w2->size(1);
+  const int I = !ffn ? 640 : w2->size(1) * 8;
+  const int group = !ffn ? 128 : H / s13->size(1);
   TORCH_CHECK(R == 320 || R <= 320, "mono_ffn: lora rank <= 320");
-  if (!hc_only) {
+  if (ffn) {
     TORCH_CHECK(E <= 512 && w13->size(0) <= kLocalE, "mono_ffn: E <= 512, local <= 128");
     TORCH_CHECK(w13->size(2) == 2 * I && w13->size(1) * 8 == H, "mono_ffn: w13 shape");
     TORCH_CHECK(Ise <= 160 && Ise % 8 == 0, "mono_ffn: shared-expert size");
@@ -1487,7 +1745,7 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
   p.norm_w = reinterpret_cast<const half*>(norm_w.data_ptr());
   p.wd = reinterpret_cast<const half*>(wd.data_ptr());
   p.wu = reinterpret_cast<const half*>(wu.data_ptr());
-  if (!hc_only) {
+  if (ffn) {
     p.wr = reinterpret_cast<const half*>(wr->data_ptr());
     p.se_w1 = reinterpret_cast<const half*>(se_w1->data_ptr());
     p.se_w2 = reinterpret_cast<const half*>(se_w2->data_ptr());
@@ -1500,6 +1758,53 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
     p.z2 = reinterpret_cast<const uint32_t*>(z2->data_ptr());
   }
   p.hc_only = hc_only ? 1 : 0;
+  if (gdn != nullptr) {
+    using namespace mono_ffn;
+    const auto& cs = *gdn->conv_state;
+    const auto& ss = *gdn->ssm_state;
+    TORCH_CHECK(H == 2560, "mono_gdn: hidden 2560");
+    TORCH_CHECK(gdn->wq->size(0) == kGdnNQ && gdn->wq->size(1) == H &&
+                    gdn->wq->is_contiguous() && gdn->wq->scalar_type() == at::kHalf,
+                "mono_gdn: in_proj_qkvz [4096, H] fp16");
+    TORCH_CHECK(gdn->wba->size(0) == kGdnNB && gdn->wba->size(1) == H &&
+                    gdn->wba->is_contiguous(), "mono_gdn: in_proj_ba [24, H]");
+    TORCH_CHECK(gdn->convw->numel() == kGdnCD * 4 && gdn->convw->is_contiguous(),
+                "mono_gdn: conv weight [2560, 4]");
+    TORCH_CHECK(cs.dim() == 3 && cs.size(1) == kGdnCD && cs.size(2) == 3 &&
+                    cs.scalar_type() == at::kHalf, "mono_gdn: conv state (slots, 2560, 3) (non-spec decode)");
+    TORCH_CHECK(ss.dim() == 4 && ss.size(1) == kGdnHV && ss.size(2) == kGdnV &&
+                    ss.size(3) == kGdnK && ss.scalar_type() == at::kFloat &&
+                    ss.stride(3) == 1 && ss.stride(2) == kGdnK &&
+                    ss.stride(1) == kGdnV * kGdnK, "mono_gdn: ssm state [slots, 12, 128, 128] fp32");
+    TORCH_CHECK(gdn->alog->numel() == kGdnHV && gdn->alog->scalar_type() == at::kFloat &&
+                    gdn->dtb->numel() == kGdnHV && gdn->dtb->scalar_type() == at::kFloat,
+                "mono_gdn: A_log / dt_bias fp32 [12]");
+    TORCH_CHECK(gdn->wo->size(0) == H && gdn->wo->size(1) == kGdnVD &&
+                    gdn->wo->is_contiguous(), "mono_gdn: out_proj [H, 1536]");
+    TORCH_CHECK(gdn->sidx->numel() >= M && gdn->sidx->scalar_type() == at::kInt,
+                "mono_gdn: state indices int32 [M]");
+    p.gdn = 1;
+    p.g_wq = reinterpret_cast<const half*>(gdn->wq->data_ptr());
+    p.g_wba = reinterpret_cast<const half*>(gdn->wba->data_ptr());
+    p.g_convw = reinterpret_cast<const half*>(gdn->convw->data_ptr());
+    p.g_convb = gdn->convb->numel() > 0
+                    ? reinterpret_cast<const half*>(gdn->convb->data_ptr()) : nullptr;
+    p.g_convs = reinterpret_cast<half*>(cs.data_ptr());
+    p.g_cs_slot = cs.stride(0);
+    p.g_cs_dim = cs.stride(1);
+    p.g_cs_t = cs.stride(2);
+    p.g_ssm = reinterpret_cast<float*>(ss.data_ptr());
+    p.g_ss_slot = ss.stride(0);
+    p.g_slots = (int)std::min(ss.size(0), cs.size(0));
+    p.g_alog = gdn->alog->data_ptr<float>();
+    p.g_dtb = gdn->dtb->data_ptr<float>();
+    p.g_normw = reinterpret_cast<const half*>(gdn->normw->data_ptr());
+    p.g_wo = reinterpret_cast<const half*>(gdn->wo->data_ptr());
+    p.g_sidx = gdn->sidx->data_ptr<int>();
+    p.g_scale = (float)gdn->scale;
+    p.g_eps = (float)gdn->eps;
+    p.g_sig = (int)gdn->sigmoid;
+  }
   int64_t off = 0;
   auto take = [&](int64_t bytes) { char* q = base + off; off += al(bytes); return q; };
   p.ctrl = reinterpret_cast<Ctrl*>(take(sizeof(Ctrl)));
@@ -1512,7 +1817,11 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
   p.se_gate = reinterpret_cast<Fx*>(take((int64_t)kMaxM * 8));
   p.act = reinterpret_cast<half*>(take((int64_t)kMaxM * kTopK * I * 2));
   p.gu = reinterpret_cast<Fx*>(take((int64_t)kMaxM * kTopK * 2 * I * 8));
+  p.g_q = reinterpret_cast<Fx*>(take((int64_t)kMaxM * kGdnNI * 8));
+  p.g_y = reinterpret_cast<half*>(take((int64_t)kMaxM * kGdnVD * 2));
+  p.g_st = reinterpret_cast<half*>(take((int64_t)kMaxM * kGdnQK * 3 * 2));
   if (hc_only) p.bin = reinterpret_cast<half*>(out.data_ptr());  // P3 writes the output
+  // GDN: P3's block_input stays in the scratch p.bin; out gets the out_proj partial
   {
     const int64_t need = mono_ffn_rdna2_workspace_bytes(H, R, ND, E, Ise, I);
     p.stats = workspace.numel() * workspace.element_size() >= need + kStatWords * 8
@@ -1581,6 +1890,28 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
               zero_offset, num_wg, eps, timeout_ms);
 }
 
+// E1: K1 + the GDN (linear-attention) decode of one layer in one launch.
+// out = out_proj partial [M, H] (pre all-reduce); conv / ssm state updated in
+// place for the rows' slots (null slots <= 0 untouched, output zero).
+void mono_gdn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
+                    const torch::Tensor& inj, const torch::Tensor& norm_w,
+                    const torch::Tensor& wd, const torch::Tensor& wu,
+                    const torch::Tensor& wq, const torch::Tensor& wba,
+                    const torch::Tensor& convw, const torch::Tensor& convb,
+                    torch::Tensor& conv_state, torch::Tensor& ssm_state,
+                    const torch::Tensor& alog, const torch::Tensor& dtb,
+                    const torch::Tensor& gnorm_w, const torch::Tensor& wo,
+                    const torch::Tensor& sidx, torch::Tensor& res_out,
+                    torch::Tensor& inj_out, torch::Tensor& out, torch::Tensor& workspace,
+                    int64_t num_wg, double eps, double gn_eps, int64_t gn_sigmoid,
+                    double scale, double timeout_ms) {
+  GdnArgs g{&wq, &wba, &convw, &convb, &gnorm_w, &wo, &sidx, &conv_state, &ssm_state,
+            &alog, &dtb, scale, gn_eps, gn_sigmoid};
+  mono_launch(res, blk, inj, norm_w, wd, wu, nullptr, nullptr, nullptr, nullptr,
+              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out, inj_out,
+              out, workspace, 0, 1, num_wg, eps, timeout_ms, &g);
+}
+
 // K1: the attention-side HC preamble (combine + grouped norm + down/up mix)
 // with the same persistent kernel, stopped after P3. out = block_input [M, H].
 void mono_hc_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
@@ -1619,6 +1950,38 @@ void mono_ffn_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width) {
                      reinterpret_cast<unsigned long long*>(stats.data_ptr()),
                      (int)kind, (int)width);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Workspace outside torch's caching allocator: an explicit coarse-grained
+// device allocation (hipExtMallocWithFlags + hipDeviceMallocDefault), zeroed,
+// kept for the process lifetime. The barrier flags, sticky record and
+// fixed-point accumulators take agent-scope atomics and polls; in a buffer
+// that ends up fine-grained (HSA_FORCE_FINE_GRAIN_PCIE=1 + the caching
+// allocator) those slowed one or two ranks per run in TP4 serving.
+torch::Tensor mono_ffn_rdna2_workspace_alloc(int64_t nbytes, int64_t device) {
+  TORCH_CHECK(nbytes > 0, "mono_ffn: workspace size");
+  const at::cuda::CUDAGuard guard((c10::DeviceIndex)device);
+  void* ptr = nullptr;
+  TORCH_CHECK(hipExtMallocWithFlags(&ptr, (size_t)nbytes, hipDeviceMallocDefault) ==
+                  hipSuccess,
+              "mono_ffn: hipExtMallocWithFlags failed");
+  TORCH_CHECK(hipMemset(ptr, 0, (size_t)nbytes) == hipSuccess, "mono_ffn: memset");
+  TORCH_CHECK(hipDeviceSynchronize() == hipSuccess, "mono_ffn: sync");
+  auto opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, device);
+  return torch::from_blob(ptr, {nbytes}, [](void*) {}, opts);  // never freed
+}
+
+// HSA global flags of a tensor's allocation (2 = fine-grained, 4 = coarse-
+// grained, 8 = extended-scope fine-grained), -1 if unavailable.
+int64_t mono_ffn_rdna2_mem_flags(const torch::Tensor& t) {
+  using fn_t = hsa_status_t (*)(const void*, hsa_amd_pointer_info_t*, void* (*)(size_t),
+                                uint32_t*, hsa_agent_t**);
+  static fn_t fn = reinterpret_cast<fn_t>(dlsym(RTLD_DEFAULT, "hsa_amd_pointer_info"));
+  if (fn == nullptr) return -1;
+  hsa_amd_pointer_info_t info{};
+  info.size = sizeof(info);
+  if (fn(t.data_ptr(), &info, nullptr, nullptr, nullptr) != HSA_STATUS_SUCCESS) return -1;
+  return (int64_t)info.global_flags;
 }
 
 torch::Tensor mono_ffn_rdna2_error(const torch::Tensor& workspace) {

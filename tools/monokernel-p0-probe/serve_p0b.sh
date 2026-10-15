@@ -25,7 +25,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 TREE=$(cd "$HERE/../.." && pwd)
 RUN=${RUN:-$HOME/w4a8_runs/monokernel-p0}
 : "${MODEL:?}" "${PLE_QUANT_DIR:?}" "${GPUS:?}"
-export RECIPE=flashnext-mtp2 GPUS PORT=${PORT:-18790} TAG=${TAG:-mono-p0b}
+export RECIPE=${RECIPE:-flashnext-mtp2} GPUS PORT=${PORT:-18790} TAG=${TAG:-mono-p0b}
 export OUT=$RUN/serve-$TAG CACHE=${CACHE:-$RUN/cache-$TAG} MODEL
 export VENV=${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.31.0-final}
 case ${PROF:-torch} in
