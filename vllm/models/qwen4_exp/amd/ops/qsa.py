@@ -887,7 +887,7 @@ def qsa_select_paged_tokens(
 
 
 _QSA_DEC_COUNTERS: dict[int, torch.Tensor] = {}
-_QSA_DEC_MIN_ROWS = 3  # the HIP decode kernel wins from 3 rows (MTP verify, c >= 3)
+_QSA_DEC_MIN_ROWS = 8  # HIP wins from ~8 rows; below, Triton + tile skip is faster
 
 
 def _qsa_decode_hip_ok(q, k_cache, v_cache, group_size) -> bool:

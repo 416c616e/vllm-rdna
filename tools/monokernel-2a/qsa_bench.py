@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--widths", default="1,3,8,24")
     ap.add_argument("--ctx", default="1024,16384")
     ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--reps", type=int, default=8)
     a = ap.parse_args()
     from torch.utils.cpp_extension import load
 
@@ -111,12 +112,18 @@ def main():
             good = same_i and d_o < 1e-3 and rel_h < 5e-3 and clean
             ok &= good
             nvalid = int((i0 >= 0).sum(1).float().mean().item())
-            t_s0 = A.graph_time(lambda: select(False), a.iters)
-            t_s1 = A.graph_time(lambda: select(True), a.iters)
+            # R calls per graph: one graph replay alone costs ~12 us on V620
+            R = a.reps
+
+            def gt(f):
+                return A.graph_time(lambda: [f() for _ in range(R)], a.iters) / R
+
+            t_s0 = gt(lambda: select(False))
+            t_s1 = gt(lambda: select(True))
             ob = torch.empty_like(qa)
-            t_a0 = A.graph_time(lambda: attend(False, i0, ob), a.iters)
-            t_a1 = A.graph_time(lambda: attend(True, i1, ob), a.iters)
-            t_h = A.graph_time(lambda: hip(i1, ob), a.iters)
+            t_a0 = gt(lambda: attend(False, i0, ob))
+            t_a1 = gt(lambda: attend(True, i1, ob))
+            t_h = gt(lambda: hip(i1, ob))
             Q.MONO_QSA = False
             print(f"ctx {ctx:5d} M={M:2d} (T={T}) valid idx {nvalid:4d} | indices "
                   f"{'same' if same_i else 'DIFF'} out diff {d_o:.1e} | select today "
