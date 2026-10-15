@@ -777,6 +777,7 @@ class CompilationConfig:
         "vllm::qwen_gdn_attention_core_fused_norm_packed",
         # MonoKernel E1' (rdna_mono_gdn): same split point as the GDN core
         "vllm::qwen_gdn_attention_core_mono",
+        "vllm::qwen_gdn_attention_core_mono_g",
         "vllm::qwen_gdn_full_forward",
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",

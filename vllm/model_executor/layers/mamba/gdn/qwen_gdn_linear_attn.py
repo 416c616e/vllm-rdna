@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import functools
 import os
 from typing import Any, Literal
 
@@ -648,6 +649,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self._mono_gdn_supported()
         )
         self._mono_gdn_cache: tuple | None = None
+        # capture the fused kernel inside FULL graphs instead of an eager break
+        self._mono_gdn_graph = self._mono_gdn and bool(
+            isinstance(extra, dict) and extra.get("rdna_mono_gdn_graph", False)
+        )
         self._mono_gdn_max_rows = (
             min(64, int(extra.get("rdna_mono_gdn_max_rows", 64)))
             if isinstance(extra, dict)
@@ -733,8 +738,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and md.spec_query_start_loc is not None
         )
 
+    def _mono_gdn_capturable(self, md: GDNAttentionMetadata, qkvz: torch.Tensor) -> bool:
+        """The fused path may be recorded into a FULL graph: every replay of it
+        is a same-shape pure decode / verify batch read from the builder's
+        static buffers (padding rows carry NULL_BLOCK_ID and are skipped)."""
+        if not self._mono_gdn_eligible(md, qkvz):
+            return False
+        if md.spec_sequence_masks is None and md.use_state_arenas:
+            # the arena gather / scatter is recorded with this step's count
+            return md.num_decodes == qkvz.shape[0]
+        return True
+
     def _forward_core_mono(
-        self, mixed_qkvz: torch.Tensor, ba: torch.Tensor, y: torch.Tensor
+        self,
+        mixed_qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        y: torch.Tensor,
+        graph: bool = False,
     ) -> None:
         """y = gated-RMSNorm(core(qkvz, ba)) for out_proj: one gdn_fused_rdna2
         launch for pure decode / pure verify batches, today's path otherwise."""
@@ -757,7 +777,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
         if use:
             alog, dtb, conv_w, conv_b, scratch, empty, H, sig = cache
-            M = md.num_actual_tokens
+            # in a FULL graph the padded batch replays: size by the buffers
+            M = mixed_qkvz.shape[0] if graph else md.num_actual_tokens
             conv_state = (
                 self.kv_cache[0]
                 if is_conv_state_dim_first()
@@ -771,7 +792,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if md.spec_sequence_masks is None:
                 sidx, nacc, qsl = md.non_spec_state_indices_tensor[:M], empty, empty
             else:
-                n = md.num_spec_decodes
+                n = md.spec_state_indices_tensor.shape[0] if graph else md.num_spec_decodes
                 sidx = md.spec_state_indices_tensor[:n]
                 nacc = md.num_accepted_tokens[:n]
                 qsl = md.spec_query_start_loc[: n + 1]
@@ -1325,9 +1346,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            torch.ops.vllm.qwen_gdn_attention_core_mono(
-                mixed_qkvz, ba, y, layer_name=_encode_layer_name(self.prefix)
-            )
+            if self._mono_gdn_graph:
+                torch.ops.vllm.qwen_gdn_attention_core_mono_g(
+                    mixed_qkvz, ba, y, layer_name=_encode_layer_name(self.prefix)
+                )
+            else:
+                torch.ops.vllm.qwen_gdn_attention_core_mono(
+                    mixed_qkvz, ba, y, layer_name=_encode_layer_name(self.prefix)
+                )
             output, _ = self.out_proj(y)
             return output
 
@@ -2621,6 +2647,43 @@ def qwen_gdn_attention_core_mono(
 direct_register_custom_op(
     op_name="qwen_gdn_attention_core_mono",
     op_func=qwen_gdn_attention_core_mono,
+    mutates_args=["mixed_qkvz", "y"],
+)
+
+
+def qwen_gdn_attention_core_mono_g(
+    mixed_qkvz: torch.Tensor,
+    ba: torch.Tensor,
+    y: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """MonoKernel E1' (rdna_mono_gdn_graph): like qwen_gdn_attention_core_mono,
+    but inside a FULL capture the fused kernel is recorded into the graph (no
+    eager break) when the batch is capturable; otherwise it breaks as usual."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    layer_name = _resolve_layer_name(layer_name)
+    self = get_forward_context().no_compile_layers[layer_name]
+    capture = BreakableCUDAGraphCapture.current()
+    if capture is not None and capture._capturing:
+        raw = get_forward_context().attn_metadata
+        md = raw.get(self.prefix) if isinstance(raw, dict) else None
+        if md is not None and self._mono_gdn_capturable(md, mixed_qkvz):
+            key = ("graph", md.spec_sequence_masks is not None, mixed_qkvz.shape[0])
+            if key not in _MONO_GDN_LOGGED:
+                _MONO_GDN_LOGGED.add(key)
+                logger.info("rdna_mono_gdn: %s %d rows captured in the FULL graph",
+                            "verify" if key[1] else "decode", key[2])
+            self._forward_core_mono(mixed_qkvz, ba, y, graph=True)
+            return
+        capture.add_eager(functools.partial(self._forward_core_mono, mixed_qkvz, ba, y))
+        return
+    self._forward_core_mono(mixed_qkvz, ba, y)
+
+
+direct_register_custom_op(
+    op_name="qwen_gdn_attention_core_mono_g",
+    op_func=qwen_gdn_attention_core_mono_g,
     mutates_args=["mixed_qkvz", "y"],
 )
 
