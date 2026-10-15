@@ -53,6 +53,7 @@
 
 #include "q_gemm_rdna2_common.cuh"
 #include "qdq_4_rdna2.cuh"
+#include "rdna_allreduce.cuh"
 
 namespace mono_ffn {
 
@@ -167,6 +168,9 @@ struct Params {
   half* g_y;            // [M, 1536] gated-norm output
   half* g_st;           // [M, 1024, 3] new q|k conv state (deferred write)
   unsigned long long timeout_ticks;
+  // Stage D: the FFN all-reduce (rdna_ar one-shot protocol) at the end of P7
+  int ar_on;
+  RdnaArDev ar;
   // Optional serve timing (workspace tail, see kStat*): per-width sums of the
   // phase times, the WG entry spread and the launch latency after a mark.
   unsigned long long* stats;
@@ -1588,8 +1592,70 @@ __global__ void __launch_bounds__(kThreads)
   }  // FFN path
 
   // ---------------- P7: out = fp16(shared + routed) (GDN: out_proj partial)
-  for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
-    p.out[i] = __float2half(p.acc[i]);
+  if (p.ar_on) {
+    // Stage D: rdna_ar one-shot step on its buffers and sequence. Push this
+    // rank's fp16 partial into every peer's slot (parity, rank), publish the
+    // flag once the whole grid has pushed, wait for the peers' flags, sum the
+    // slots in rank order (bitwise the same on every rank, like rdna_ar).
+    const int W = p.ar.world, me = p.ar.rank;
+    const int seq =
+        __hip_atomic_load(p.ar.seqbuf, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) + 1;
+    const int par = seq & 1;
+    const long long slot = p.ar.max_bytes / 2;
+    for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads) {
+      const half h = __float2half(p.acc[i]);
+      p.out[i] = h;
+      for (int k = 1; k < W; k++) {
+        const int j = (me + k) % W;
+        reinterpret_cast<half*>(p.ar.peers.stage[j])[((long long)par * W + me) * slot + i] = h;
+      }
+    }
+    __threadfence_system();
+    if (!grid_barrier(p, 7, &s_flag)) return;
+    if (wg == 0 && tid == 0) {
+      __hip_atomic_store(p.ar.seqbuf, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      for (int j = 0; j < W; j++)
+        __hip_atomic_store(&p.ar.peers.flags[j][me], seq, __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __shared__ int s_ar_ok;
+    if (tid == 0) {
+      int ok = 1;
+      const int* mine = p.ar.peers.flags[me];
+      const unsigned long long t0 = wall_clock64();
+      for (int j = 0; j < W && ok; j++) {
+        if (j == me) continue;
+        while (__hip_atomic_load(&mine[j], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+          __builtin_amdgcn_s_sleep(8);
+          if (err_set(p.ctrl) || wall_clock64() - t0 > p.timeout_ticks) {
+            int zero = 0;
+            if (__hip_atomic_compare_exchange_strong(&p.ctrl->err_code, &zero, 1,
+                                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                                     __HIP_MEMORY_SCOPE_AGENT)) {
+              p.ctrl->err_phase = 8;  // the fused all-reduce wait
+              p.ctrl->err_wg = blockIdx.x;
+            }
+            ok = 0;
+            break;
+          }
+        }
+      }
+      s_ar_ok = ok;
+    }
+    __syncthreads();
+    if (!s_ar_ok) return;
+    const half* stage = reinterpret_cast<const half*>(p.ar.peers.stage[me]) +
+                        (long long)par * W * slot;
+    for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads) {
+      float v = 0.f;
+      for (int j = 0; j < W; j++)
+        v += __half2float(j == me ? p.out[i] : stage[(long long)j * slot + i]);
+      p.out[i] = __float2half(v);
+    }
+  } else {
+    for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
+      p.out[i] = __float2half(p.acc[i]);
+  }
   if (wg == 0 && tid == 0) {
     p.ctrl->ts[7] = wall_clock64();
     if (timing) {  // every WG entered before barrier 1, so min/max are final
@@ -1689,6 +1755,26 @@ int64_t mono_ffn_rdna2_workspace_bytes(int64_t H, int64_t R, int64_t ND,
          al(M * 2 * Ise * 8) + al(M * 8) + al(M * kTopK * I * 2) +
          al(M * kTopK * 2 * I * 8) + al(M * kGdnNI * 8) + al(M * kGdnVD * 2) +
          al(M * kGdnQK * 3 * 2);
+}
+
+// Stage D: the rdna_ar instance whose buffers the FFN launches reduce into
+// (per device; -1 = the caller all-reduces the partial itself).
+static long long g_mono_ar_handle[64] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+
+// Returns the per-slot byte limit of the attached instance (0: not attached).
+int64_t mono_ffn_rdna2_set_ar(int64_t handle, int64_t device) {
+  TORCH_CHECK(device >= 0 && device < 64, "mono_ffn: device index");
+  RdnaArDev d{};
+  if (handle < 0 || !rdna_ar_device(handle, &d)) {
+    g_mono_ar_handle[device] = -1;
+    return 0;
+  }
+  g_mono_ar_handle[device] = handle;
+  return d.max_bytes;
 }
 
 struct GdnArgs {
@@ -1841,6 +1927,11 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
   {
     const char* pf = getenv("MONO_FFN_PREFETCH");
     p.prefetch = (pf && pf[0] == '1') ? 1 : 0;
+  }
+  if (ffn && gdn == nullptr) {
+    const long long h = g_mono_ar_handle[res.get_device()];
+    if (h >= 0 && rdna_ar_device(h, &p.ar) && (long long)M * H * 2 <= p.ar.max_bytes)
+      p.ar_on = 1;
   }
   int khz = 0;
   hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, res.get_device());

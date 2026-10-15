@@ -234,34 +234,38 @@ __global__ void __launch_bounds__(kThreads) qsa_dec_k(const Args a) {
   if (tid == 0) s_last = atomicAdd(&a.cnt[blockIdx.x], 1) == a.S - 1;
   __syncthreads();
   if (!s_last) return;
-  __threadfence();
-  // merge the splits (last split of this (row, kv head)); other WGs wrote the
-  // partials, so read them past this CU's L0 (agent-scope atomic loads)
+  // acquire at agent scope invalidates this CU's L0/L1, so the other splits'
+  // partials can be read with plain (pipelined) loads
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  // merge the splits (last split of this (row, kv head))
   __shared__ float s_w[kMaxG][kMaxS];
-  if (tid < G) {
-    const int h = h0 + tid;
-    float mm = -INFINITY;
-    for (int s2 = 0; s2 < a.S; s2++)
-      mm = fmaxf(mm, __hip_atomic_load(&a.plse[((long)s2 * a.M + row) * a.QH + h],
-                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
-    float den = 0.f;
-    for (int s2 = 0; s2 < a.S; s2++) {
-      const float x = __hip_atomic_load(&a.plse[((long)s2 * a.M + row) * a.QH + h],
-                                        __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      const float wgt = mm > -INFINITY ? exp2f(x - mm) : 0.f;
-      s_w[tid][s2] = wgt;
-      den += wgt;
+  {
+    // weights: thread (h, s) for every split of every head of the group
+    for (int i = tid; i < G * a.S; i += kThreads) {
+      const int hl = i / a.S, s2 = i % a.S;
+      s_w[hl][s2] = a.plse[((long)s2 * a.M + row) * a.QH + h0 + hl];
     }
-    s_L[tid] = den;
+    __syncthreads();
+    if (tid < G) {
+      float mm = -INFINITY;
+      for (int s2 = 0; s2 < a.S; s2++) mm = fmaxf(mm, s_w[tid][s2]);
+      float den = 0.f;
+      for (int s2 = 0; s2 < a.S; s2++) {
+        const float wgt = mm > -INFINITY ? exp2f(s_w[tid][s2] - mm) : 0.f;
+        s_w[tid][s2] = wgt;
+        den += wgt;
+      }
+      s_L[tid] = den;
+    }
+    __syncthreads();
   }
-  __syncthreads();
   for (int i = tid; i < G * kHD; i += kThreads) {
     const int hl = i / kHD, d = i % kHD, h = h0 + hl;
+    const float* src = a.po + ((long)row * a.QH + h) * kHD + d;
+    const long sstride = (long)a.M * a.QH * kHD;
     float num = 0.f;
 #pragma unroll 8
-    for (int s2 = 0; s2 < a.S; s2++)
-      num += s_w[hl][s2] * __hip_atomic_load(&a.po[(((long)s2 * a.M + row) * a.QH + h) * kHD + d],
-                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    for (int s2 = 0; s2 < a.S; s2++) num += s_w[hl][s2] * src[s2 * sstride];
     const float den = s_L[hl];
     a.out[row * a.so_row + (long)h * a.so_head + d] = __float2half(den > 0.f ? num / den : 0.f);
   }

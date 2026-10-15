@@ -46,6 +46,8 @@ _NUM_WG = 0  # 0: residency cap
 _TUNE = {"sleep": 0, "flags": 0}
 _MODES = {"full", "piecewise", "eager"}
 _HC_ON = False  # K1: attention-side HC preamble on the persistent kernel
+_AR_ON = False  # Stage D: the FFN all-reduce inside the kernel (rdna_ar buffers)
+_AR_MAX: dict[int, int] = {}  # per device: rdna_ar slot bytes once attached
 _HC_MAX_ROWS = MAX_ROWS
 _ZEROS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _STAT_COLS = 36
@@ -68,6 +70,8 @@ def mono_ffn_requested(vllm_config) -> bool:
     _TUNE["sleep"] = int(extra.get("rdna_mono_ffn_sleep", 0))
     _TUNE["flags"] = int(extra.get("rdna_mono_ffn_flags", 0))
     _HC_ON = bool(extra.get("rdna_mono_hc", False))
+    global _AR_ON
+    _AR_ON = bool(extra.get("rdna_mono_ffn_ar", False))
     _HC_MAX_ROWS = min(MAX_ROWS, int(extra.get("rdna_mono_hc_max_rows", MAX_ROWS)))
     if _TIMING:
         _wrap_linear_all_reduce()
@@ -111,6 +115,8 @@ def _workspace(device: torch.device) -> torch.Tensor:
         # stats / tuning block right after the kernel's workspace
         st = ws[nbytes : nbytes + _STAT_WORDS * 8].view(torch.int64)
         sc = _STAT_ROWS * _STAT_COLS
+        if _AR_ON:
+            _attach_ar(idx)
         st[sc + 0] = -1  # entry_min
         st[sc + 5] = _TUNE["sleep"]
         st[sc + 6] = _TUNE["flags"]
@@ -118,6 +124,30 @@ def _workspace(device: torch.device) -> torch.Tensor:
             st[sc + 3] = 1  # enabled
             _STATS[idx] = st
     return ws
+
+
+def _attach_ar(idx: int) -> None:
+    """Stage D: point the FFN launches of this device at the TP group's
+    rdna_ar one-shot buffers; the kernel then returns the all-reduced output."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        comm = getattr(get_tp_group().device_communicator, "rdna_ar_comm", None)
+        handle = comm.handle if comm is not None and not comm.disabled else -1
+        _AR_MAX[idx] = int(torch.ops._rocm_C.mono_ffn_rdna2_set_ar(handle, idx))
+    except Exception as e:  # noqa: BLE001
+        _AR_MAX[idx] = 0
+        logger.warning("rdna_mono_ffn_ar: not attached (%s)", e)
+    logger.info("rdna_mono_ffn_ar: cuda:%d %s", idx,
+                f"fused all-reduce up to {_AR_MAX[idx]} B" if _AR_MAX[idx] else "off")
+
+
+def _ar_fused(x: torch.Tensor) -> bool:
+    """Mirrors the kernel's rule for doing the all-reduce itself."""
+    if not _AR_ON:
+        return False
+    lim = _AR_MAX.get(x.device.index if x.device.index is not None else 0, 0)
+    return lim > 0 and x.numel() * x.element_size() <= lim
 
 
 def _corr(n, sx, sy, sxx, syy, sxy) -> float:
@@ -449,7 +479,10 @@ def _mono_ffn_block(
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         res_out, partial, inj_out = mono.run(hidden_states, attn_out, injection)
-        result = res_out, tensor_model_parallel_all_reduce(partial), inj_out
+        if _ar_fused(partial):  # Stage D: the kernel already all-reduced it
+            result = res_out, partial, inj_out
+        else:
+            result = res_out, tensor_model_parallel_all_reduce(partial), inj_out
     else:
         hs, block_input, inj = layer.mlp_hyper_connection.combine_and_mix(
             hidden_states, attn_out, injection

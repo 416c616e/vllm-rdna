@@ -42,7 +42,7 @@ def build_ext():
     SRC = os.environ.get("MONO_SRC_DIR", os.path.join(TREE, "csrc/rocm"))
     return load(
         name="mono_ffn_ext",
-        sources=[os.path.join(SRC, "mono_ffn_rdna2.cu"),
+        sources=[os.path.join(SRC, "mono_ffn_rdna2.cu"), os.path.join(SRC, "rdna_allreduce.cu"),
                  os.path.join(HERE, "ext_binding.cpp")],
         extra_include_paths=[SRC],
         extra_cuda_cflags=["-O3", "--offload-arch=gfx1030", "-ffp-contract=fast",

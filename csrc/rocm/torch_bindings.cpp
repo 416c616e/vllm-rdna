@@ -106,6 +106,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("mono_ffn_rdna2_workspace_alloc", &mono_ffn_rdna2_workspace_alloc);
   rocm_ops.def("mono_ffn_rdna2_mem_flags(Tensor t) -> int");
   rocm_ops.impl("mono_ffn_rdna2_mem_flags", &mono_ffn_rdna2_mem_flags);
+  rocm_ops.def("mono_ffn_rdna2_set_ar(int handle, int device) -> int");
+  rocm_ops.impl("mono_ffn_rdna2_set_ar", &mono_ffn_rdna2_set_ar);
   rocm_ops.def(
       "mono_hc_rdna2(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, Tensor wd, "
       "Tensor wu, Tensor! res_out, Tensor! inj_out, Tensor! out, Tensor! workspace, "

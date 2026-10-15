@@ -160,6 +160,19 @@ struct RdnaArPeers {
 
 // Backoff between polls: s_sleep(n) idles the wave ~64*n clocks (~0.2 us at
 // n=8) so a waiting rank does not saturate its memory path while spinning.
+// What another kernel needs to run a one-shot all-reduce step on the same
+// buffers and sequence (MonoKernel Stage D): it must follow the same protocol
+// (push to stage[j] slot (parity, rank), bump *seqbuf, publish flags[j][rank],
+// wait for flags[rank][j] >= seq, sum the slots in rank order).
+struct RdnaArDev {
+  RdnaArPeers peers;
+  int* seqbuf;
+  long long max_bytes;  // per slot
+  int rank, world, ready;
+};
+// Host side (rdna_allreduce.cu): false if the handle is not a ready instance.
+bool rdna_ar_device(long long handle, RdnaArDev* out);
+
 #define RDNA_AR_POLL_PAUSE() __builtin_amdgcn_s_sleep(8)
 
 template <typename T>

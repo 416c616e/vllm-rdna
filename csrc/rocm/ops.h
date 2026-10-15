@@ -72,6 +72,7 @@ torch::Tensor mono_ffn_rdna2_error(const torch::Tensor& workspace);
 void mono_ffn_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width);
 torch::Tensor mono_ffn_rdna2_workspace_alloc(int64_t nbytes, int64_t device);
 int64_t mono_ffn_rdna2_mem_flags(const torch::Tensor& t);
+int64_t mono_ffn_rdna2_set_ar(int64_t handle, int64_t device);
 void mono_gdn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                     const torch::Tensor& inj, const torch::Tensor& norm_w,
                     const torch::Tensor& wd, const torch::Tensor& wu,
