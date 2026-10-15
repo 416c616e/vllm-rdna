@@ -5,5 +5,5 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 "${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.31.0-final}/bin/python" "$HERE/logprob_parity.py" \
     dump --url "http://127.0.0.1:$PORT" --model "$SERVED" --out "$OUT/parity.json" || { echo FAIL; exit 1; }
-grep -a "rdna_mono_ffn" "$OUT/serve.log" | sed 's/^.*rdna_mono_ffn/rdna_mono_ffn/' | sort | uniq -c | head -40
+grep -a "rdna_mono_" "$OUT/serve.log" | sed 's/^.*rdna_mono_/rdna_mono_/' | sort | uniq -c | head -40
 echo PASS

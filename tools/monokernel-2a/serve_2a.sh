@@ -24,8 +24,9 @@ case $ARM in
     on) AC="{\"rdna_mono_ffn\":true$X}" ;;
     on-t) AC="{\"rdna_mono_ffn\":true,\"rdna_mono_ffn_timing\":true$X}" ;;
     off-t) AC="{\"rdna_mono_ffn\":true,\"rdna_mono_ffn_timing\":true,\"rdna_mono_ffn_modules\":true$X}" ;;
+    gdn) AC="{\"rdna_mono_gdn\":true$X}" ;;  # E1' alone
     off) AC= ;;
-    *) echo "ARM=on|off|on-t|off-t" >&2; exit 2 ;;
+    *) echo "ARM=on|off|on-t|off-t|gdn" >&2; exit 2 ;;
 esac
 if [[ -n $AC ]]; then
     export EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--additional-config $AC"
