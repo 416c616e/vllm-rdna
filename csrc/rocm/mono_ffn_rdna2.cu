@@ -374,6 +374,9 @@ __device__ __forceinline__ void zero48(float (&acc)[4][8]) {
     for (int m = 0; m < 8; m++) acc[r][m] = 0.f;
 }
 
+#ifndef MONO_FFN_E1A
+#define MONO_FFN_E1A 0
+#endif
 #ifndef MONO_FFN_ROWU
 #define MONO_FFN_ROWU 4  // row_dot weight loads in flight per lane
 #endif
@@ -1038,6 +1041,7 @@ __global__ void __launch_bounds__(kThreads)
   }
   if (wg == 0 && tid == 0) p.ctrl->ts[3] = wall_clock64();
 
+#if MONO_FFN_E1A  // E1a GDN mode (reference only; off: it costs the FFN path ~25%)
   if (p.gdn) {
     // fp16 GEMV out[m, col0 + n] = W[n, :] . X[m, :]: two output rows per wave
     // over the whole K, all M rows in one pass (row_dot2).
@@ -1205,7 +1209,9 @@ __global__ void __launch_bounds__(kThreads)
     }
     if (!grid_barrier(p, 6, &s_flag)) return;
     if (wg == 0 && tid == 0) p.ctrl->ts[6] = wall_clock64();
-  } else {
+  } else
+#endif
+  {
 
   // ---------------- P4: router (fp32 logits), shared-expert gate_up, expert
   // gate; K split, fp32 atomics.
@@ -1758,6 +1764,7 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
     p.z2 = reinterpret_cast<const uint32_t*>(z2->data_ptr());
   }
   p.hc_only = hc_only ? 1 : 0;
+  TORCH_CHECK(gdn == nullptr || MONO_FFN_E1A, "mono_gdn_rdna2: built without MONO_FFN_E1A");
   if (gdn != nullptr) {
     using namespace mono_ffn;
     const auto& cs = *gdn->conv_state;
