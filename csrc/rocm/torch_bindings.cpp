@@ -119,6 +119,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor! workspace, int num_wg, float eps, float gn_eps, int gn_sigmoid, "
       "float scale, float timeout_ms) -> ()");
   rocm_ops.impl("mono_gdn_rdna2", torch::kCUDA, &mono_gdn_rdna2);
+  rocm_ops.def(
+      "gdn_fused_rdna2(Tensor qkvz, Tensor ba, Tensor conv_w, Tensor conv_b, "
+      "Tensor! conv_state, Tensor! ssm_state, Tensor A_log, Tensor dt_bias, "
+      "Tensor norm_w, Tensor sidx, Tensor nacc, Tensor qsl, Tensor! y, "
+      "Tensor! scratch, int num_k_heads, float scale, float eps, "
+      "int gate_sigmoid) -> ()");
+  rocm_ops.impl("gdn_fused_rdna2", torch::kCUDA, &gdn_fused_rdna2);
+  rocm_ops.def("gdn_fused_rdna2_scratch_bytes(int M, int HV, int H) -> int");
+  rocm_ops.impl("gdn_fused_rdna2_scratch_bytes", &gdn_fused_rdna2_scratch_bytes);
 #endif
   rocm_ops.def(
       "rdna_se_gate_up_silu(Tensor x, Tensor w, Tensor? scale) -> Tensor");

@@ -84,6 +84,15 @@ void mono_gdn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                     torch::Tensor& inj_out, torch::Tensor& out, torch::Tensor& workspace,
                     int64_t num_wg, double eps, double gn_eps, int64_t gn_sigmoid,
                     double scale, double timeout_ms);
+void gdn_fused_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
+                     const torch::Tensor& conv_w, const torch::Tensor& conv_b,
+                     torch::Tensor& conv_state, torch::Tensor& ssm_state,
+                     const torch::Tensor& A_log, const torch::Tensor& dt_bias,
+                     const torch::Tensor& norm_w, const torch::Tensor& sidx,
+                     const torch::Tensor& nacc, const torch::Tensor& qsl,
+                     torch::Tensor& y, torch::Tensor& scratch, int64_t num_k_heads,
+                     double scale, double eps, int64_t gate_sigmoid);
+int64_t gdn_fused_rdna2_scratch_bytes(int64_t M, int64_t HV, int64_t H);
 void mono_hc_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    const torch::Tensor& inj, const torch::Tensor& norm_w,
                    const torch::Tensor& wd, const torch::Tensor& wu,
