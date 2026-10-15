@@ -58,6 +58,7 @@ def _qsa_mqa_paged_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    EARLY_EXIT: tl.constexpr = 0,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -76,6 +77,12 @@ def _qsa_mqa_paged_kernel(
     )
     if tl.program_id(1) == 0:
         tl.store(visible_blocks_ptr + row, visible)
+    if EARLY_EXIT:
+        # E3: the decode top-k reads columns [0, visible) only, so tiles past
+        # the live context neither score nor store (valid inside CUDA graphs,
+        # where the host column bound is the capture-time worst case)
+        if tl.program_id(1) * BLOCK_N >= visible:
+            return
     logical_page = columns // PAGE_SIZE
     page_offset = columns % PAGE_SIZE
     valid = (
@@ -721,6 +728,7 @@ def qsa_mqa_paged(
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
         COMPRESS_RATIO=compress_ratio,
+        EARLY_EXIT=1 if MONO_QSA and not current_platform.is_cuda() else 0,
         num_warps=_QSA_MQA_WARPS,
         **_qsa_mqa_extra,
     )
@@ -887,7 +895,7 @@ def qsa_select_paged_tokens(
 
 
 _QSA_DEC_COUNTERS: dict[int, torch.Tensor] = {}
-_QSA_DEC_MIN_ROWS = 8  # HIP wins from ~8 rows; below, Triton + tile skip is faster
+_QSA_DEC_MIN_ROWS = 3  # HIP (plain-load merge) wins from 3 rows at long context
 
 
 def _qsa_decode_hip_ok(q, k_cache, v_cache, group_size) -> bool:

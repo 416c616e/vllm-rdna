@@ -78,12 +78,14 @@ def main():
             kc, vc = kv[:, :, 0], kv[:, :, 1]
             out_w = TOPK + RATIO - 1
 
-            def select(bound):
+            def select(bound, host_bound=True):
+                # host_bound False: E3 inside a CUDA graph (worst-case columns,
+                # the scoring kernel's device-side early exit only)
                 Q.MONO_QSA = bound
                 return Q.qsa_select_paged_tokens(
                     qi, ccache, ctab, t2r, pos, seq, TOPK, RATIO,
                     torch.empty(M, out_w, dtype=torch.int32, device=dev),
-                    max_seq_len=ctx if bound else None)
+                    max_seq_len=ctx if bound and host_bound else None)
 
             def attend(skip, idx, out):
                 Q.MONO_QSA = skip
@@ -100,7 +102,9 @@ def main():
             o0 = attend(False, i0, torch.empty_like(qa))
             o1 = attend(True, i1, torch.empty_like(qa))
             torch.cuda.synchronize()
-            same_i = bool(torch.equal(i0.sort(1).values, i1.sort(1).values))
+            i2 = select(True, host_bound=False)
+            same_i = bool(torch.equal(i0.sort(1).values, i1.sort(1).values)) and bool(
+                torch.equal(i0.sort(1).values, i2.sort(1).values))
             d_o = (o0.float() - o1.float()).abs().max().item()
             oh = hip(i0, torch.empty_like(qa))
             torch.cuda.synchronize()
@@ -120,6 +124,7 @@ def main():
 
             t_s0 = gt(lambda: select(False))
             t_s1 = gt(lambda: select(True))
+            t_s2 = gt(lambda: select(True, host_bound=False))
             ob = torch.empty_like(qa)
             t_a0 = gt(lambda: attend(False, i0, ob))
             t_a1 = gt(lambda: attend(True, i1, ob))
@@ -127,7 +132,7 @@ def main():
             Q.MONO_QSA = False
             print(f"ctx {ctx:5d} M={M:2d} (T={T}) valid idx {nvalid:4d} | indices "
                   f"{'same' if same_i else 'DIFF'} out diff {d_o:.1e} | select today "
-                  f"{t_s0:6.1f} us e3 {t_s1:6.1f} us x{t_s0 / t_s1:.2f} | attn today "
+                  f"{t_s0:6.1f} us e3 {t_s1:6.1f} us x{t_s0 / t_s1:.2f} in-graph {t_s2:6.1f} us | attn today "
                   f"{t_a0:6.1f} us skip {t_a1:6.1f} us hip(S={S}) {t_h:6.1f} us x{t_a0 / t_h:.2f}"
                   f" (hip rel {rel_h:.1e}) {'ok' if good else 'BAD'}")
     print("OK" if ok else "BAD")
