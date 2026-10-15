@@ -1121,6 +1121,99 @@ def qsa_store_cache_rows(
     )
 
 
+@triton.jit
+def _store_qsa_rows3_kernel(
+    c_cache_ptr, c_slots_ptr, c_rows_ptr,  # compressed keys (compressed slots)
+    r_cache_ptr, r_slots_ptr, r_rows_ptr,  # raw keys (raw slots)
+    p_cache_ptr, p_rows_ptr,               # rope positions (raw slots)
+    c_sb, c_st, c_sd, c_rr, c_rd, c_nb,
+    r_sb, r_st, r_sd, r_rr, r_rd, r_nb,
+    p_sb, p_st, p_sd, p_rr, p_rd, p_nb,
+    num_rows,
+    C_PAGE: tl.constexpr, C_WIDTH: tl.constexpr, C_BLOCK: tl.constexpr,
+    R_PAGE: tl.constexpr, R_WIDTH: tl.constexpr, R_BLOCK: tl.constexpr,
+    P_PAGE: tl.constexpr, P_WIDTH: tl.constexpr, P_BLOCK: tl.constexpr,
+) -> None:
+    """MonoKernel E3: the indexer's three per-token cache stores in one launch
+    (same masking as _store_qsa_rows_kernel, applied to each store)."""
+    row = tl.program_id(0)
+    # compressed key row
+    dims = tl.arange(0, C_BLOCK)
+    slot = tl.load(c_slots_ptr + row)
+    ok = (row < num_rows) & (slot >= 0) & (slot < c_nb * C_PAGE)
+    blk = tl.maximum(slot, 0) // C_PAGE
+    tok = tl.maximum(slot, 0) % C_PAGE
+    v = tl.load(c_rows_ptr + row * c_rr + dims * c_rd, mask=ok & (dims < C_WIDTH), other=0)
+    tl.store(c_cache_ptr + blk * c_sb + tok * c_st + dims * c_sd, v, mask=ok & (dims < C_WIDTH))
+    # raw key row and its rope positions share the raw slot
+    slot = tl.load(r_slots_ptr + row)
+    dims = tl.arange(0, R_BLOCK)
+    ok = (row < num_rows) & (slot >= 0) & (slot < r_nb * R_PAGE)
+    blk = tl.maximum(slot, 0) // R_PAGE
+    tok = tl.maximum(slot, 0) % R_PAGE
+    v = tl.load(r_rows_ptr + row * r_rr + dims * r_rd, mask=ok & (dims < R_WIDTH), other=0)
+    tl.store(r_cache_ptr + blk * r_sb + tok * r_st + dims * r_sd, v, mask=ok & (dims < R_WIDTH))
+    pdims = tl.arange(0, P_BLOCK)
+    pok = (row < num_rows) & (slot >= 0) & (slot < p_nb * P_PAGE)
+    pblk = tl.maximum(slot, 0) // P_PAGE
+    ptok = tl.maximum(slot, 0) % P_PAGE
+    pv = tl.load(p_rows_ptr + row * p_rr + pdims * p_rd, mask=pok & (pdims < P_WIDTH), other=0)
+    tl.store(p_cache_ptr + pblk * p_sb + ptok * p_st + pdims * p_sd, pv,
+             mask=pok & (pdims < P_WIDTH))
+
+
+def qsa_store_cache_rows3(
+    c_cache: torch.Tensor,
+    c_slots: torch.Tensor,
+    c_rows: torch.Tensor,
+    r_cache: torch.Tensor,
+    r_slots: torch.Tensor,
+    r_rows: torch.Tensor,
+    p_cache: torch.Tensor,
+    p_rows: torch.Tensor,
+) -> bool:
+    """One launch for the three indexer stores; False when the shapes are not
+    the one-head, same-row-count case (the caller then stores one by one)."""
+    if qsa_rdna2.qsa_use_rdna2() or not HAS_TRITON:
+        return False
+    rows = []
+    for cache, slots, r in ((c_cache, c_slots, c_rows), (r_cache, r_slots, r_rows),
+                            (p_cache, r_slots, p_rows)):
+        if cache.ndim != 4 or cache.shape[2] != 1 or not all(cache.shape):
+            return False
+        if r.ndim == 3:
+            if r.shape[1] != 1:
+                return False
+            r = r[:, 0]
+        if r.shape != (slots.numel(), cache.shape[3]):
+            return False
+        rows.append(r)
+    n = rows[0].shape[0]
+    if rows[1].shape[0] != n or rows[2].shape[0] != n:
+        return False
+    if n == 0:
+        return True
+    cr, rr, pr = rows
+    _store_qsa_rows3_kernel[(n,)](
+        c_cache, c_slots, cr, r_cache, r_slots, rr, p_cache, pr,
+        c_cache.stride(0), c_cache.stride(1), c_cache.stride(3), cr.stride(0), cr.stride(1),
+        c_cache.shape[0],
+        r_cache.stride(0), r_cache.stride(1), r_cache.stride(3), rr.stride(0), rr.stride(1),
+        r_cache.shape[0],
+        p_cache.stride(0), p_cache.stride(1), p_cache.stride(3), pr.stride(0), pr.stride(1),
+        p_cache.shape[0],
+        n,
+        C_PAGE=c_cache.shape[1], C_WIDTH=c_cache.shape[3],
+        C_BLOCK=triton.next_power_of_2(c_cache.shape[3]),
+        R_PAGE=r_cache.shape[1], R_WIDTH=r_cache.shape[3],
+        R_BLOCK=triton.next_power_of_2(r_cache.shape[3]),
+        P_PAGE=p_cache.shape[1], P_WIDTH=p_cache.shape[3],
+        P_BLOCK=triton.next_power_of_2(p_cache.shape[3]),
+        num_warps=4,
+    )
+    return True
+
+
 def qsa_compress_groups_with_ratio(
     raw_keys: torch.Tensor,  # this step's raw key rows [rows, 1, head_size]
     raw_positions: torch.Tensor,  # this step's positions [rows, 1, 3] int64

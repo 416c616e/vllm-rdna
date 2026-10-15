@@ -351,6 +351,20 @@ class QSAIndexer(nn.Module):
             rope_position_cache,
         )
         normalized = self.normalize_compressed_keys(pooled, first_positions)
+        if self._mono_qsa and rope_position_cache is not None:
+            from .ops.qsa import qsa_store_cache_rows3
+
+            if qsa_store_cache_rows3(
+                self.compressed_key_cache.kv_cache,
+                compressed_metadata.slot_mapping,
+                normalized,
+                raw_key_cache,
+                raw_metadata.slot_mapping,
+                token_k[:num_tokens],
+                rope_position_cache,
+                position_rows,
+            ):
+                return
         qsa_store_cache_rows(
             self.compressed_key_cache.kv_cache,
             compressed_metadata.slot_mapping,
