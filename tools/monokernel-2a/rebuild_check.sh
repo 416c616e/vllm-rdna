@@ -10,6 +10,7 @@ TREE=$(cd "$HERE/../.." && pwd)
 OUT=${OUT:?}
 LOCKDIR=${LOCKDIR:-$HOME/w4a8_runs/port-v031/GPU69.lockdir}
 mkdir -p "$OUT"
+sleep "${LOCK_YIELD_S:-90}"  # let a waiting agent in first
 until mkdir "$LOCKDIR" 2>/dev/null; do sleep 15; done
 echo "monokernel-2a: rebuild + standalone checks" > "$LOCKDIR/owner"
 trap 'rm -rf "$LOCKDIR"' EXIT

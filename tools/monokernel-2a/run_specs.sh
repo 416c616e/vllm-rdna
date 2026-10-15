@@ -22,8 +22,12 @@ wait_idle() {
 }
 # shared HIP 6-9 lock (atomic mkdir), held for one serve at a time
 LOCKDIR=${LOCKDIR:-$HOME/w4a8_runs/port-v031/GPU69.lockdir}
+LAST_UNLOCK=0
 lock() {
     [[ ${LOCK:-1} == 1 ]] || return 0
+    # let a waiting agent in: no re-acquire within 90 s of our own release
+    local wait=$(( LAST_UNLOCK + ${LOCK_YIELD_S:-90} - $(date +%s) ))
+    (( wait > 0 )) && sleep "$wait"
     until mkdir "$LOCKDIR" 2>/dev/null; do sleep 30; done
     echo "monokernel-2a: $1" > "$LOCKDIR/owner"
     HELD=1
@@ -59,6 +63,7 @@ for spec in "${list[@]}"; do
         bash "$HERE/serve_2a.sh" ${kv:-} > "$RUN/$name.out" 2>&1
     kill "$clk" 2>/dev/null; rm -f "$out/clocks.pid"
     unlock
+    LAST_UNLOCK=$(date +%s)
     zcat -f "$out"/serve.log* 2>/dev/null | grep -a "rdna_mono_ffn timing" \
         | sed 's/^.*rdna_mono_ffn timing //' \
         | awk '{k=$1" "$2; last[k]=$0} END{for (k in last) print last[k]}' | sort > "$out/timing.txt"
