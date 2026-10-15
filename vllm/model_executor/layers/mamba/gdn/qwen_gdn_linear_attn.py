@@ -738,12 +738,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         md = raw.get(self.prefix) if isinstance(raw, dict) else None
         use = md is not None and self._mono_gdn_eligible(md, mixed_qkvz)
         if md is not None:
-            key = (md.spec_sequence_masks is not None, md.num_actual_tokens, use)
+            # one line per (kind, width) for decode-sized batches, one for all
+            # prefill / mixed batches
+            rows = md.num_actual_tokens if md.num_prefills == 0 else -1
+            key = (md.spec_sequence_masks is not None, rows, use)
             if key not in _MONO_GDN_LOGGED:
                 _MONO_GDN_LOGGED.add(key)
                 logger.info(
-                    "rdna_mono_gdn: %s %d rows (prefills %d) -> %s",
-                    "verify" if key[0] else "decode", key[1], md.num_prefills,
+                    "rdna_mono_gdn: %s %s -> %s",
+                    "verify" if key[0] else "decode",
+                    f"{rows} rows" if rows >= 0 else "with prefill",
                     "fused kernel" if use else "today's path",
                 )
         if use:

@@ -134,6 +134,17 @@ class QSAIndexer(nn.Module):
         # pinning BF16.
         qsa_dtype = vllm_config.model_config.dtype
 
+        # MonoKernel E3 (additional_config "rdna_mono_qsa", off by default):
+        # bound decode scoring to the live context (QSA runs as an eager break
+        # in every cudagraph mode, so the host bound is valid per step) and
+        # skip all-padding tiles in sparse attention. Both are exact.
+        extra = getattr(vllm_config, "additional_config", None) or {}
+        self._mono_qsa = isinstance(extra, dict) and bool(extra.get("rdna_mono_qsa", False))
+        if self._mono_qsa:
+            from .ops import qsa as _qsa_ops
+
+            _qsa_ops.MONO_QSA = True
+
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
         self.index_kv_heads = int(config.indexer_kv_heads)
@@ -312,7 +323,9 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
-            max_seq_len=metadata.max_seq_len if metadata.num_prefills else None,
+            max_seq_len=metadata.max_seq_len
+            if metadata.num_prefills or self._mono_qsa
+            else None,
         )
 
     def forward(

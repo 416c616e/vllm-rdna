@@ -93,6 +93,12 @@ void gdn_fused_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
                      torch::Tensor& y, torch::Tensor& scratch, int64_t num_k_heads,
                      double scale, double eps, int64_t gate_sigmoid);
 int64_t gdn_fused_rdna2_scratch_bytes(int64_t M, int64_t HV, int64_t H);
+void qsa_decode_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
+                      const torch::Tensor& v_cache, const torch::Tensor& indices,
+                      const torch::Tensor& block_table, const torch::Tensor& token_to_req,
+                      torch::Tensor& out, torch::Tensor& scratch, torch::Tensor& counters,
+                      int64_t splits);
+int64_t qsa_decode_rdna2_splits(int64_t M, int64_t KVH, int64_t W);
 void mono_hc_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    const torch::Tensor& inj, const torch::Tensor& norm_w,
                    const torch::Tensor& wd, const torch::Tensor& wu,

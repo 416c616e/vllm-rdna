@@ -21,6 +21,8 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 # kernel stays on Triton (prefill-only, large M).
 from . import qsa_rdna2
 
+# MonoKernel E3: set by QSAIndexer when additional_config rdna_mono_qsa is on
+MONO_QSA = False
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
@@ -229,6 +231,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NOT_SKIP: tl.constexpr = 1,  # 0 = skip all-padding tiles (E3)
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -264,59 +267,66 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=columns < TOPK,
             other=-1,
         )
-        safe_token = tl.maximum(logical_token, 0)
-        logical_page = safe_token // PAGE_SIZE
-        page_offset = safe_token % PAGE_SIZE
-        valid = (
-            (request >= 0)
-            & (request < num_requests)
-            & (logical_token >= 0)
-            & (logical_page < PAGE_TABLE_WIDTH)
-        )
-        physical_page = tl.load(
-            block_table_ptr
-            + safe_request * stride_table_req
-            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-            mask=valid,
-            other=-1,
-        )
-        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
-        # physical_page * block stride can overflow int32 for large caches.
-        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
-        scores = tl.where(valid[None, :], scores, -1.0e20)
-        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.where(
-            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
-        )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
-        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
-        max_value = next_max
+        # E3: all-padding tiles (the selection is a valid prefix + -1s)
+        # contribute nothing; skip their K/V loads and dots
+        if NOT_SKIP:
+            live = True  # compile-time: today's kernel unchanged
+        else:
+            live = tl.max(logical_token, axis=0) >= 0
+        if live:
+            safe_token = tl.maximum(logical_token, 0)
+            logical_page = safe_token // PAGE_SIZE
+            page_offset = safe_token % PAGE_SIZE
+            valid = (
+                (request >= 0)
+                & (request < num_requests)
+                & (logical_token >= 0)
+                & (logical_page < PAGE_TABLE_WIDTH)
+            )
+            physical_page = tl.load(
+                block_table_ptr
+                + safe_request * stride_table_req
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=valid,
+                other=-1,
+            )
+            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+            # physical_page * block stride can overflow int32 for large caches.
+            safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            scores = tl.dot(query, keys)
+            # Scaling scores avoids re-quantizing a scaled query to BF16.
+            scores *= softmax_scale_log2
+            scores = tl.where(valid[None, :], scores, -1.0e20)
+            next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+            alpha = tl.math.exp2(max_value - next_max)
+            probabilities = tl.where(
+                valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+            )
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
+            normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+            max_value = next_max
 
     has_values = normalizer > 0
     normalized_output = tl.where(
@@ -876,6 +886,41 @@ def qsa_select_paged_tokens(
     return out
 
 
+_QSA_DEC_COUNTERS: dict[int, torch.Tensor] = {}
+_QSA_DEC_MIN_ROWS = 3  # the HIP decode kernel wins from 3 rows (MTP verify, c >= 3)
+
+
+def _qsa_decode_hip_ok(q, k_cache, v_cache, group_size) -> bool:
+    return (
+        _QSA_DEC_MIN_ROWS <= q.shape[0] <= 64
+        and q.dtype == torch.float16
+        and q.shape[2] == 256
+        and group_size <= 8
+        and k_cache.stride(3) == 1
+        and v_cache.stride(3) == 1
+        and all(st % 8 == 0 for st in (*k_cache.stride()[:3], *v_cache.stride()[:3]))
+        and q.stride(0) % 8 == 0
+        and q.stride(1) % 8 == 0
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "qsa_decode_rdna2")
+    )
+
+
+def _qsa_decode_hip(q, k_cache, v_cache, indices, block_table, token_to_req, out):
+    """MonoKernel E3: one-launch HIP sparse decode attention (split + merge)."""
+    dev = q.device.index if q.device.index is not None else torch.cuda.current_device()
+    counters = _QSA_DEC_COUNTERS.get(dev)
+    if counters is None:  # QSA runs as an eager break: never allocated under capture
+        counters = torch.zeros(64 * 64, dtype=torch.int32, device=q.device)
+        _QSA_DEC_COUNTERS[dev] = counters
+    rows, heads, kvh = q.shape[0], q.shape[1], k_cache.shape[2]
+    splits = int(torch.ops._rocm_C.qsa_decode_rdna2_splits(rows, kvh, indices.shape[1]))
+    scratch = torch.empty(splits * rows * heads * 257, dtype=torch.float32, device=q.device)
+    torch.ops._rocm_C.qsa_decode_rdna2(
+        q, k_cache, v_cache, indices, block_table, token_to_req, out, scratch, counters, splits
+    )
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -924,6 +969,9 @@ def qsa_sparse_paged_attention(
         return out
 
     group_size = q.shape[1] // k_cache.shape[2]
+    if MONO_QSA and _qsa_decode_hip_ok(q, k_cache, v_cache, group_size):
+        _qsa_decode_hip(q, k_cache, v_cache, logical_indices, block_table, token_to_req, out)
+        return out
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
@@ -1007,6 +1055,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        NOT_SKIP=0 if MONO_QSA else 1,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

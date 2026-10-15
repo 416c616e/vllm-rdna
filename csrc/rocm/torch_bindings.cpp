@@ -128,6 +128,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("gdn_fused_rdna2", torch::kCUDA, &gdn_fused_rdna2);
   rocm_ops.def("gdn_fused_rdna2_scratch_bytes(int M, int HV, int H) -> int");
   rocm_ops.impl("gdn_fused_rdna2_scratch_bytes", &gdn_fused_rdna2_scratch_bytes);
+  rocm_ops.def(
+      "qsa_decode_rdna2(Tensor q, Tensor k_cache, Tensor v_cache, Tensor indices, "
+      "Tensor block_table, Tensor token_to_req, Tensor! out, Tensor! scratch, "
+      "Tensor! counters, int splits) -> ()");
+  rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
+  rocm_ops.def("qsa_decode_rdna2_splits(int M, int KVH, int W) -> int");
+  rocm_ops.impl("qsa_decode_rdna2_splits", &qsa_decode_rdna2_splits);
 #endif
   rocm_ops.def(
       "rdna_se_gate_up_silu(Tensor x, Tensor w, Tensor? scale) -> Tensor");
