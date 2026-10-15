@@ -48,7 +48,7 @@ _MODES = {"full", "piecewise", "eager"}
 _HC_ON = False  # K1: attention-side HC preamble on the persistent kernel
 _HC_MAX_ROWS = MAX_ROWS
 _ZEROS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-_STAT_COLS = 28
+_STAT_COLS = 36
 _STAT_ROWS = MAX_ROWS + 1
 _STAT_WORDS = (_STAT_ROWS + 1) * _STAT_COLS
 _TICKS_PER_US = 100.0  # wall_clock64 runs at 100 MHz on V620
@@ -111,6 +111,17 @@ def _workspace(device: torch.device) -> torch.Tensor:
     return ws
 
 
+def _corr(n, sx, sy, sxx, syy, sxy) -> float:
+    """Pearson correlation from running sums (0 if degenerate)."""
+    if n < 2:
+        return 0.0
+    vx = sxx - sx * sx / n
+    vy = syy - sy * sy / n
+    if vx <= 0 or vy <= 0:
+        return 0.0
+    return (sxy - sx * sy / n) / (vx * vy) ** 0.5
+
+
 def _log_stats():
     """Per-width means (µs) of the serve timing, all devices of this process."""
     now = time.monotonic()
@@ -130,11 +141,16 @@ def _log_stats():
                 "rdna_mono_ffn timing dev%d w%d: region n=%d %.1f us | kernel n=%d "
                 "total %.1f phases %s | entry spread %.1f wg0 %.1f | mark->first %.1f "
                 "mark->last %.1f | rest n=%d %.1f us | attn n=%d %.1f us (hc %.1f) | "
-                "linear AR n=%d %.1f us | core qsa n=%d %.1f gdn n=%d %.1f",
+                "linear AR n=%d %.1f us | core qsa n=%d %.1f gdn n=%d %.1f | "
+                "sclk attn %.0f ffn %.0f MHz | load pairs %.2f corr(pairs, kernel) %.2f",
                 idx, w, nm, us(r[13], nm), n, us(r[9], n), ph, us(r[8], n),
                 us(r[10], n), us(r[14], n), us(r[15], n), ng, us(r[17], ng),
                 r[18], us(r[19], r[18]), us(r[21], r[20]), r[22], us(r[23], r[22]),
                 r[24], us(r[25], r[24]), r[26], us(r[27], r[26]),
+                100.0 * r[28] / r[29] if r[29] else 0.0,
+                100.0 * r[30] / r[31] if r[31] else 0.0,
+                r[32] / n if n else 0.0,
+                _corr(n, r[32], r[9], r[33], r[35], r[34]),
             )
 
 

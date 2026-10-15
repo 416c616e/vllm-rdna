@@ -82,19 +82,20 @@ def main():
     ok &= nan
     # serve timing stats (workspace tail) + marks
     ws.zero_()
-    st = ws[nb : nb + 26 * 28 * 8].view(torch.int64)
-    st[25 * 28] = -1
-    st[25 * 28 + 3] = 1
+    st = ws[nb : nb + 26 * 36 * 8].view(torch.int64)
+    st[25 * 36] = -1
+    st[25 * 36 + 3] = 1
     for _ in range(3):
         torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 0, 3)
         run(res, blk, inj)
         torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 1, 3)
     torch.cuda.synchronize()
-    r = st.view(26, 28)[3].tolist()
+    r = st.view(26, 36)[3].tolist()
     print("stats w3: launches", r[0], "phases us", [round(v / r[0] / 100, 1) for v in r[1:8]],
           "spread us", round(r[8] / r[0] / 100, 1), "total us", round(r[9] / r[0] / 100, 1),
           "| marks", r[12], "region us", round(r[13] / max(r[12], 1) / 100, 1),
-          "mark->first/last us", round(r[14] / r[0] / 100, 1), round(r[15] / r[0] / 100, 1))
+          "mark->first/last us", round(r[14] / r[0] / 100, 1), round(r[15] / r[0] / 100, 1),
+          "| sclk over region MHz", round(100.0 * r[30] / max(r[31], 1)))
     ok &= r[0] == 3 and r[12] == 3 and r[13] > r[9] > 0
     print("OK" if ok else "BAD")
 
