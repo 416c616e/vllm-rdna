@@ -756,7 +756,7 @@ __global__ void __launch_bounds__(kThreads)
 
   // ---------------- P2: HC down+inject GEMV
   if constexpr (kTileHC) {  // 32 x 64 LDS tiles, K split, fp32 atomics
-    constexpr int TX = 32, TY = 8, TM = 4, NC = 2, BN = TX * NC;
+    constexpr int TX = 32, TY = 8, TM = MT <= 16 ? 2 : 4, NC = 2, BN = TX * NC;
     const int nblk = (ND + BN - 1) / BN;
     const int splits = max(1, min(64, (2 * G + nblk - 1) / nblk));
     const int kps = ((HCH + splits - 1) / splits + 31) / 32 * 32;
@@ -964,7 +964,7 @@ __global__ void __launch_bounds__(kThreads)
   // ---------------- P4: router (fp32 logits), shared-expert gate_up, expert
   // gate; K split, fp32 atomics.
   if constexpr (kTileHC) {  // same 32 x 64 LDS tiles over the E + 2*Ise + 1 rows
-    constexpr int TX = 32, TY = 8, TM = 4, NC = 2, BN = TX * NC;
+    constexpr int TX = 32, TY = 8, TM = MT <= 16 ? 2 : 4, NC = 2, BN = TX * NC;
     const int NTOT = p.E + 2 * p.Ise + 1;
     const int nblk = (NTOT + BN - 1) / BN;
     const int splits = max(1, min(20, (2 * G + nblk - 1) / nblk));
