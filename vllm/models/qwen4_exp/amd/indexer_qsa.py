@@ -106,6 +106,53 @@ def apply_qsa_rmsnorm(
     return cast(torch.Tensor, norm(tensor))
 
 
+def apply_qsa_rmsnorm_rope(
+    norm: GemmaRMSNorm,
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    tensor: torch.Tensor,
+) -> torch.Tensor | None:
+    """MonoKernel E3: GemmaRMSNorm + the main attention's RoPE / interleaved
+    MRoPE in one Triton launch (the fused q/k norm-rope kernel with no q-gate
+    heads), instead of rms_norm + cos/sin gather + copies + mrope. Returns None
+    when the rotary layout is not one that kernel covers."""
+    num_tokens, num_heads, head_dim = tensor.shape
+    mrope_section = getattr(rotary_emb, "mrope_section", None)
+    if positions.ndim == 2:
+        if not (mrope_section and len(mrope_section) == 3
+                and getattr(rotary_emb, "mrope_interleaved", False)):
+            return None
+    elif positions.ndim != 1:
+        return None
+    if not getattr(rotary_emb, "is_neox_style", False) or tensor.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return None
+    from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
+
+    flat = tensor.reshape(num_tokens, num_heads * head_dim)
+    if flat.stride(-1) != 1:
+        flat = flat.contiguous()
+    cache = rotary_emb._match_cos_sin_cache_dtype(tensor)  # noqa: SLF001
+    _, out, _ = fused_qk_rmsnorm_rope_gate(
+        flat,  # no q-gate heads: only the "k" side runs
+        flat,
+        norm.weight,
+        norm.weight,
+        cache,
+        positions,
+        norm.variance_epsilon,
+        0,
+        num_heads,
+        head_dim,
+        rotary_emb.rotary_dim,
+        mrope_section=mrope_section if positions.ndim == 2 else None,
+        norm_beta=1.0,  # GemmaRMSNorm scales by (1 + w)
+    )
+    return out.view(num_tokens, num_heads, head_dim)
+
+
 class QSAIndexer(nn.Module):
     """Replicated Q/K projection plus paged, weight-free QSA selection.
 
@@ -212,6 +259,13 @@ class QSAIndexer(nn.Module):
             dim=-1,
         )
         q = q_raw.reshape(-1, self.index_n_heads, self.index_head_dim)
+        fused = (
+            apply_qsa_rmsnorm_rope(self.q_layernorm, self.rotary_emb, positions, q)
+            if self._mono_qsa
+            else None
+        )
+        if fused is not None:
+            return fused, token_k.reshape(-1, 1, self.index_head_dim)
         q = apply_qsa_rmsnorm(
             self.q_layernorm,
             q.reshape(-1, self.index_head_dim),
@@ -225,14 +279,23 @@ class QSAIndexer(nn.Module):
         first_rope_positions: torch.Tensor,
     ) -> torch.Tensor:
         """Normalize pooled K and apply the first token's exact group position."""
-        keys = compressed_keys.reshape(-1, self.index_head_dim)
-        keys = apply_qsa_rmsnorm(self.k_layernorm, keys).reshape(
-            -1, 1, self.index_head_dim
-        )
         if getattr(self.rotary_emb, "mrope_section", None):
             positions = first_rope_positions.transpose(0, 1)
         else:
             positions = first_rope_positions[:, 0]
+        if self._mono_qsa:
+            fused = apply_qsa_rmsnorm_rope(
+                self.k_layernorm,
+                self.rotary_emb,
+                positions,
+                compressed_keys.reshape(-1, 1, self.index_head_dim),
+            )
+            if fused is not None:
+                return fused
+        keys = compressed_keys.reshape(-1, self.index_head_dim)
+        keys = apply_qsa_rmsnorm(self.k_layernorm, keys).reshape(
+            -1, 1, self.index_head_dim
+        )
         return apply_qsa_rope(self.rotary_emb, positions, keys)
 
     def _metadata(

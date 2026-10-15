@@ -54,7 +54,7 @@ for spec in "${list[@]}"; do
     clk=$!
     echo "$clk" > "$out/clocks.pid"
     ARM=$arm RECIPE=flashnext-$mtp TAG=$name MONO_CFG="$cfg" \
-        CACHE=$RUN/cache-2a-$tag-$arm CELLS="$CELLS" BENCH_EXTRA="--temperature 0" \
+        CACHE=$RUN/cache-2a-${CACHE_TAG:-$tag}-$arm CELLS="$CELLS" BENCH_EXTRA="--temperature 0" \
         LOAD_HOOK=${LOAD_HOOK:-$HERE/parity_hook.sh} \
         bash "$HERE/serve_2a.sh" ${kv:-} > "$RUN/$name.out" 2>&1
     kill "$clk" 2>/dev/null; rm -f "$out/clocks.pid"
