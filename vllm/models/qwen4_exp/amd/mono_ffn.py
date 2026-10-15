@@ -48,7 +48,7 @@ _MODES = {"full", "piecewise", "eager"}
 _HC_ON = False  # K1: attention-side HC preamble on the persistent kernel
 _HC_MAX_ROWS = MAX_ROWS
 _ZEROS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-_STAT_COLS = 24
+_STAT_COLS = 28
 _STAT_ROWS = MAX_ROWS + 1
 _STAT_WORDS = (_STAT_ROWS + 1) * _STAT_COLS
 _TICKS_PER_US = 100.0  # wall_clock64 runs at 100 MHz on V620
@@ -130,10 +130,11 @@ def _log_stats():
                 "rdna_mono_ffn timing dev%d w%d: region n=%d %.1f us | kernel n=%d "
                 "total %.1f phases %s | entry spread %.1f wg0 %.1f | mark->first %.1f "
                 "mark->last %.1f | rest n=%d %.1f us | attn n=%d %.1f us (hc %.1f) | "
-                "linear AR n=%d %.1f us",
+                "linear AR n=%d %.1f us | core qsa n=%d %.1f gdn n=%d %.1f",
                 idx, w, nm, us(r[13], nm), n, us(r[9], n), ph, us(r[8], n),
                 us(r[10], n), us(r[14], n), us(r[15], n), ng, us(r[17], ng),
                 r[18], us(r[19], r[18]), us(r[21], r[20]), r[22], us(r[23], r[22]),
+                r[24], us(r[25], r[24]), r[26], us(r[27], r[26]),
             )
 
 
@@ -278,12 +279,12 @@ def hc_enabled() -> bool:
     return _HC_ON
 
 
-def _mark(kind: int, x: torch.Tensor) -> None:
-    """Serve timing mark (see mono_mark_kernel); FULL-graph capture only."""
+def _mark(kind: int, x: torch.Tensor, qsa: bool = False) -> None:
+    """Serve timing mark (see mono_mark_kernel); captured graphs only."""
     m = x.shape[0]
     st = _STATS.get(x.device.index)
     if st is not None and 0 < m <= MAX_ROWS and _mode() != "eager":
-        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, kind, m)
+        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, kind, m | (32 if qsa else 0))
 
 
 def _mono_attn_hc(
@@ -416,7 +417,8 @@ def _mono_ffn_block(
     if _TIMING and not torch.cuda.is_current_stream_capturing():
         _log_stats()
     if st is not None:
-        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 5, m)  # attention block done
+        qsa = getattr(layer, "layer_type", "") != "linear_attention"
+        torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 5, m | (32 if qsa else 0))  # attention done
         torch.ops._rocm_C.mono_ffn_rdna2_mark(st, 0 if mono.first else 2, m)
     if use:
         from vllm.distributed import tensor_model_parallel_all_reduce

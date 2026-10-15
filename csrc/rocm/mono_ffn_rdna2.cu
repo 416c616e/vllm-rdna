@@ -149,10 +149,12 @@ struct Params {
 //  -> this region's start: the rest of the layer)  18/19 attention spans/time
 //  (HC preamble + attention/GDN + its all-reduce)  20/21 HC preamble
 //  spans/time (attention-side combine + mix)  22/23 attention all-reduce
-//  calls/time (RowParallelLinear). Wall-clock ticks (100 MHz).
+//  calls/time (RowParallelLinear)  24/25 attention core (HC preamble end ->
+//  attention + all-reduce end) on QSA layers, 26/27 on GDN layers (width
+//  argument bit 5 = QSA). Wall-clock ticks (100 MHz).
 // Tuning (0 = default): sleep = s_sleep argument while polling a barrier
 // (1, 2, 4, 8, 16, 32, 64, 127); flags bit 0 = skip the per-WG debug stores.
-constexpr int kStatCols = 24;
+constexpr int kStatCols = 28;
 constexpr int kTuneSleep = 5, kTuneFlags = 6, kFlagNoDebug = 1;
 constexpr int kStatRows = kMaxM + 1;
 constexpr int kStatWords = (kStatRows + 1) * kStatCols;
@@ -1361,7 +1363,8 @@ __global__ void __launch_bounds__(kThreads)
 // the previous region ended, 1: end) and the attention block (3: start,
 // 4: end of the attention-side HC preamble, 5: end after the attention
 // all-reduce) and around RowParallelLinear's all-reduce (6: start, 7: end).
-__global__ void mono_mark_kernel(unsigned long long* stats, int kind, int width) {
+__global__ void mono_mark_kernel(unsigned long long* stats, int kind, int wtype) {
+  const int width = wtype & 31, qsa = wtype >> 5;
   unsigned long long* sc = stats + kStatRows * kStatCols;
   unsigned long long* row = stats + width * kStatCols;
   const unsigned long long t = wall_clock64();
@@ -1375,9 +1378,14 @@ __global__ void mono_mark_kernel(unsigned long long* stats, int kind, int width)
   } else if (kind == 4) {
     row[20] += 1;
     row[21] += t - sc[7];
+    sc[9] = t;
   } else if (kind == 5) {
     row[18] += 1;
     row[19] += t - sc[7];
+    if (sc[9] != 0 && t > sc[9]) {
+      row[qsa ? 24 : 26] += 1;
+      row[qsa ? 25 : 27] += t - sc[9];
+    }
   } else if (kind == 1) {
     row[12] += 1;
     row[13] += t - sc[2];
@@ -1581,7 +1589,7 @@ void mono_ffn_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width) {
   using namespace mono_ffn;
   TORCH_CHECK(stats.scalar_type() == at::kLong && stats.numel() >= kStatWords,
               "mono_ffn_mark: int64 stats block");
-  TORCH_CHECK(width >= 0 && width <= kMaxM, "mono_ffn_mark: width");
+  TORCH_CHECK((width & 31) <= kMaxM, "mono_ffn_mark: width");
   const at::cuda::OptionalCUDAGuard guard(device_of(stats));
   hipLaunchKernelGGL(mono_mark_kernel, dim3(1), dim3(1), 0,
                      at::cuda::getCurrentCUDAStream(),
