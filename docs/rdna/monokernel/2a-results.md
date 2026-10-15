@@ -156,3 +156,46 @@ Stop 2a.
 * **Fallback option:** gating the kernel to M ≤ 8 would be ITL-neutral at best, so it is not worth carrying.
 * **What to keep:** the kernel, the integration (default off) and the in-serve timing tools stay on the branch as reference. The timing hook is a reusable way to time any FFN-region change inside FULL graphs on this stack.
 * **Next lever:** the gap the M1 reference suggested at M > 8 is not present in the serve. The decode levers worth chasing are the ones P0 listed for the all-reduce and attention side, not the FFN glue.
+
+
+## Stage E and the all-on MonoKernel (2026-10-15)
+
+Superseding the recommendation above: with the later work the MonoKernel parts
+are all on together and faster than off. Raw results:
+`bench_results/2026-10-14_monokernel-2a/stage-e/` (infra repo).
+
+**All-on** = `rdna_mono_ffn` (max rows 8) + `rdna_mono_hc` (K1) +
+`rdna_mono_gdn` (E1') + `rdna_mono_qsa` (E3), all off by default.
+
+* **E1' (`gdn_fused_rdna2`)**: conv update + gated delta rule + gated RMSNorm
+  in one launch for pure decode / MTP-verify batches (<= 64 rows); today's
+  path for anything else, inside the same op (a splitting op, like the GDN
+  core). Standalone 1.11-1.90x on the replaced region (64 cold layers),
+  conv state exact, ssm state <= 7e-8.
+* **E3 (QSA)**: live-context bound for host-run scoring, early exit of
+  scoring tiles past the live context (valid inside CUDA graphs), all-padding
+  tile skip in sparse attention, a one-launch HIP sparse decode
+  (`qsa_decode_rdna2`, from 3 rows), the indexer norm + MRoPE in one launch
+  and the three indexer cache stores in one launch.
+* **Fix that made all-on additive**: the abandoned E1a GDN mode compiled into
+  the persistent FFN kernel slowed every FFN / K1 phase ~25% (standalone
+  w1/3/8 151.7/201.5/311.2 us -> 117.2/165.5/251.3 us without it); now behind
+  `MONO_FFN_E1A=0`.
+
+### A13: all-on vs off, same session, alternating (4x V620, TP4, FG=0)
+
+Cells: prefill tok/s/req / decode tok/s/req / TTFT s / ITL median ms.
+
+| recipe / cell | off | all-on | ITL |
+| --- | --- | --- | --- |
+| MTP2 1k c=1 | 2096 / 70.35 / 0.49 / 28.8 | 2248 / 75.98 / 0.46 / 25.3 | -12.2% |
+| MTP2 1k c=8 | 893 / 31.21 / 1.15 / 61.3 | 1011 / 29.54 / 1.01 / 58.7 | -4.2% |
+| MTP2 16k c=1 | 2034 / 87.24 / 8.06 / 29.1 | 2039 / 100.04 / 8.04 / 26.2 | -10.0% |
+| MTP2 16k c=8 | 1374 / 13.94 / 11.93 / 62.1 | 1396 / 14.15 / 11.73 / 61.2 | -1.4% |
+| MTP0 1k c=1 | 2001 / 44.99 / 0.51 / 22.2 | 2165 / 46.86 / 0.47 / 21.3 | -4.1% |
+| MTP0 1k c=8 | 523 / 25.87 / 1.96 / 35.1 | 566 / 26.75 / 1.81 / 34.1 | -2.8% |
+| MTP0 16k c=1 | 2105 / 44.47 / 7.78 / 22.5 | 2104 / 46.09 / 7.79 / 21.7 | -3.6% |
+| MTP0 16k c=8 | 1074 / 13.33 / 15.26 / 35.8 | 1070 / 13.43 / 15.32 / 34.8 | -2.8% |
+
+Prefill and TTFT at parity or better (16k MTP0 within 0.5%). All gates pass;
+logprob parity inside off-vs-off noise.
