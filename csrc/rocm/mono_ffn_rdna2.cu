@@ -1610,16 +1610,20 @@ __global__ void __launch_bounds__(kThreads)
         reinterpret_cast<half*>(p.ar.peers.stage[j])[((long long)par * W + me) * slot + i] = h;
       }
     }
-    __threadfence_system();
+    // one system fence per WG (like rdna_ar), not per thread: a per-thread
+    // system fence writes L2 back once per wave
+    __syncthreads();
+    if (tid == 0) __threadfence_system();
     if (!grid_barrier(p, 7, &s_flag)) return;
+    __shared__ int s_ar_ok;
     if (wg == 0 && tid == 0) {
       __hip_atomic_store(p.ar.seqbuf, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
       for (int j = 0; j < W; j++)
         __hip_atomic_store(&p.ar.peers.flags[j][me], seq, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
     }
-    __shared__ int s_ar_ok;
-    if (tid == 0) {
+    // WG0 alone polls the peers' flags; the grid barrier then releases the rest
+    if (wg == 0 && tid == 0) {
       int ok = 1;
       const int* mine = p.ar.peers.flags[me];
       const unsigned long long t0 = wall_clock64();
@@ -1643,7 +1647,8 @@ __global__ void __launch_bounds__(kThreads)
       s_ar_ok = ok;
     }
     __syncthreads();
-    if (!s_ar_ok) return;
+    if (wg == 0 && !s_ar_ok) return;  // sticky error set: the others leave the barrier
+    if (!grid_barrier(p, 8, &s_flag)) return;
     const half* stage = reinterpret_cast<const half*>(p.ar.peers.stage[me]) +
                         (long long)par * W * slot;
     for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads) {
