@@ -648,6 +648,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self._mono_gdn_supported()
         )
         self._mono_gdn_cache: tuple | None = None
+        self._mono_gdn_max_rows = (
+            min(64, int(extra.get("rdna_mono_gdn_max_rows", 64)))
+            if isinstance(extra, dict)
+            else 64
+        )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -703,7 +708,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return self._mono_gdn_cache
 
     def _mono_gdn_eligible(self, md: GDNAttentionMetadata, qkvz: torch.Tensor) -> bool:
-        if md.num_prefills > 0 or md.num_actual_tokens > 64:
+        if md.num_prefills > 0 or md.num_actual_tokens > self._mono_gdn_max_rows:
             return False
         if (
             qkvz.dtype != torch.float16

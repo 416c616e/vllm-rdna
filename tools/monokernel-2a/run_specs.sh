@@ -11,10 +11,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 RUN=${RUN:-$HOME/w4a8_runs/monokernel-2a}
 : "${GPUS:?}" "${SPECS:?}"
 CELLS=${CELLS:-"1024:512:1 1024:512:8"}
-SMI_DEVS=${SMI_DEVS:-"0 1 2 3"}  # rocm-smi GPU[0-3] are HIP 6-9 on this box
+SMI_DEVS=${SMI_DEVS:-"0 1 2 3"}  # rocm-smi GPU[0-3] = HIP 6-9, GPU[4-7] = HIP 2-5
 wait_idle() {
     for _ in $(seq 1 120); do
-        busy=$(rocm-smi --showmemuse 2>/dev/null | awk '/GPU\[[0-3]\].*VRAM%/{s+=$NF} END{print s+0}')
+        busy=$(rocm-smi -d $SMI_DEVS --showmemuse 2>/dev/null | awk '/VRAM%/{s+=$NF} END{print s+0}')
         [[ $busy -eq 0 ]] && return 0
         sleep 10
     done
