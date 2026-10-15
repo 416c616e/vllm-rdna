@@ -20,11 +20,27 @@ wait_idle() {
     done
     return 1
 }
+# shared HIP 6-9 lock (atomic mkdir), held for one serve at a time
+LOCKDIR=${LOCKDIR:-$HOME/w4a8_runs/port-v031/GPU69.lockdir}
+lock() {
+    [[ ${LOCK:-1} == 1 ]] || return 0
+    until mkdir "$LOCKDIR" 2>/dev/null; do sleep 30; done
+    echo "monokernel-2a: $1" > "$LOCKDIR/owner"
+    HELD=1
+}
+HELD=0
+unlock() {  # only a lock this script took
+    [[ $HELD == 1 ]] && rm -rf "$LOCKDIR"
+    HELD=0
+    return 0
+}
+trap unlock EXIT
 IFS=';' read -ra list <<< "$SPECS"
 for spec in "${list[@]}"; do
     IFS='|' read -r mtp arm tag cfg kv <<< "$spec"
-    wait_idle || { echo "GPUs not idle"; exit 1; }
     name=$tag-$mtp-$arm
+    lock "$name"
+    wait_idle || { echo "GPUs not idle"; exit 1; }
     out=$RUN/serve-$name
     echo "== $(date +%H:%M:%S) $name cfg={$cfg} ${kv:-}"
     mkdir -p "$out"
@@ -42,6 +58,7 @@ for spec in "${list[@]}"; do
         LOAD_HOOK=${LOAD_HOOK:-$HERE/parity_hook.sh} \
         bash "$HERE/serve_2a.sh" ${kv:-} > "$RUN/$name.out" 2>&1
     kill "$clk" 2>/dev/null; rm -f "$out/clocks.pid"
+    unlock
     zcat -f "$out"/serve.log* 2>/dev/null | grep -a "rdna_mono_ffn timing" \
         | sed 's/^.*rdna_mono_ffn timing //' \
         | awk '{k=$1" "$2; last[k]=$0} END{for (k in last) print last[k]}' | sort > "$out/timing.txt"
