@@ -95,6 +95,16 @@ __global__ void __launch_bounds__(kThreads) qsa_dec_k(const Args a) {
   const int j0 = (int)((long)split * a.W / a.S), j1 = (int)((long)(split + 1) * a.W / a.S);
   const int* irow = a.idx + row * a.sidx;
   const int* brow = a.btab + (long)(req_ok ? req : 0) * a.sbt;
+  // the selection is a valid prefix + -1 padding: a split starting on padding
+  // has nothing to attend to (at short contexts about half of them)
+  __shared__ int s_empty;
+  if (tid == 0) s_empty = a.S > 1 && (j0 >= j1 || !req_ok || irow[j0] < 0);
+  __syncthreads();
+  const long base = (long)split * a.M + row;
+  __shared__ int s_last;
+  if (s_empty) {
+    if (tid < G) a.plse[base * a.QH + h0 + tid] = -INFINITY;
+  } else {
   // a wave takes chunks of 32 selected tokens: lane i resolves token i's page
   // (index + block-table loads in parallel), then the wave walks the chunk with
   // the page / offset broadcast from the owning lane, K / V loads kept 2 ahead
@@ -180,7 +190,6 @@ __global__ void __launch_bounds__(kThreads) qsa_dec_k(const Args a) {
   // combine the 8 waves in a fixed order
   __shared__ float s_m[kWaves][kMaxG], s_l[kWaves][kMaxG];
   __shared__ float s_acc[kMaxG][kHD];
-  __shared__ int s_last;
   if (lane == 0)
 #pragma unroll
     for (int h = 0; h < G; h++) {
@@ -216,7 +225,6 @@ __global__ void __launch_bounds__(kThreads) qsa_dec_k(const Args a) {
     s_M[tid] = mm;
   }
   __syncthreads();
-  const long base = (long)split * a.M + row;
   for (int i = tid; i < G * kHD; i += kThreads) {
     const int h = i / kHD, d = i % kHD;
     const float L = s_L[h];
@@ -229,6 +237,7 @@ __global__ void __launch_bounds__(kThreads) qsa_dec_k(const Args a) {
     }
   }
   if (a.S == 1) return;
+  }  // non-empty split
   __threadfence();
   __syncthreads();
   if (tid == 0) s_last = atomicAdd(&a.cnt[blockIdx.x], 1) == a.S - 1;
@@ -265,7 +274,8 @@ __global__ void __launch_bounds__(kThreads) qsa_dec_k(const Args a) {
     const long sstride = (long)a.M * a.QH * kHD;
     float num = 0.f;
 #pragma unroll 8
-    for (int s2 = 0; s2 < a.S; s2++) num += s_w[hl][s2] * src[s2 * sstride];
+    for (int s2 = 0; s2 < a.S; s2++)  // empty splits wrote no output
+      if (s_w[hl][s2] != 0.f) num += s_w[hl][s2] * src[s2 * sstride];
     const float den = s_L[hl];
     a.out[row * a.so_row + (long)h * a.so_head + d] = __float2half(den > 0.f ? num / den : 0.f);
   }

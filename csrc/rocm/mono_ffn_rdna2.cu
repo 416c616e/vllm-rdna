@@ -378,6 +378,12 @@ __device__ __forceinline__ void zero48(float (&acc)[4][8]) {
     for (int m = 0; m < 8; m++) acc[r][m] = 0.f;
 }
 
+#ifndef MONO_FFN_P2_ROWS4  // HC down / up GEMVs at M <= 8 on 4-row wave tasks
+#define MONO_FFN_P2_ROWS4 0
+#endif
+#ifndef MONO_FFN_P3_ROWS4
+#define MONO_FFN_P3_ROWS4 0
+#endif
 #ifndef MONO_FFN_E1A
 #define MONO_FFN_E1A 0
 #endif
@@ -871,7 +877,7 @@ __global__ void __launch_bounds__(kThreads)
         }
       }
     }
-  } else if constexpr (kRow) {  // wave per row, K split, fp32 atomics
+  } else if constexpr (kRow && !MONO_FFN_P2_ROWS4) {  // wave per row, K split, fp32 atomics
     const int K8 = HCH / 8;
     const int ksplit = max(1, (2 * GW + ND - 1) / ND);
     const int chunk = (K8 + ksplit - 1) / ksplit;
@@ -974,7 +980,7 @@ __global__ void __launch_bounds__(kThreads)
         p.bin[(size_t)row * H + h] = __float2half(mix * (1.f / kHC));
       }
     }
-  } else if constexpr (kRow) {  // today's hc_up_gate_mix_k loop, wave per h
+  } else if constexpr (kRow && !MONO_FFN_P3_ROWS4) {  // today's hc_up_gate_mix_k loop, wave per h
     for (int h = gw; h < H; h += GW) {
       for (int m0 = 0; m0 < M; m0 += MC) {
         float mix[MC];
