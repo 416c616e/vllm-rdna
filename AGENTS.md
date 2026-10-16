@@ -40,6 +40,34 @@ MODEL=/path/to/checkpoint VENV=/path/to/venv \
   `--dtype float16`.
 - Enabling AITER or CK backends: they are CDNA-only. Keep `VLLM_ROCM_USE_AITER=0`.
 
+### RDNA code rules
+
+- **Never break other platforms.** Gate RDNA changes with the helpers in
+  `vllm/platforms/rocm.py` (`on_gfx10x()`, `on_gfx1x()`, `on_rdna()`), never
+  globally and never with an exact `"gfx1030" in arch` string match. CUDA, CDNA
+  (AITER), GCN and CPU paths must keep working.
+- **FP16 only on gfx1030.** RDNA2 has no BF16 dot instructions; BF16 kernels
+  either fail to compile or run emulated. Keep BF16 paths for other archs.
+- **Wave32.** Size Triton/HIP kernels for 32-lane waves: `num_warps` <= 4 and
+  RDNA-sized tiles, not CDNA (wave64, 128x128) configs.
+- **Launch on the current stream.** HIP kernels capture
+  `at::cuda::getCurrentCUDAStream()` and launch with `<<<grid, block, 0, stream>>>`,
+  followed by `C10_CUDA_KERNEL_LAUNCH_CHECK()`. A plain `<<<grid, block>>>` goes to
+  the null stream, races the model stream and fails silently.
+- **Zero atomically-accumulated outputs.** Kernels that accumulate with atomics
+  need `torch.zeros`, not `torch.empty`.
+- **Never route to wvSplitK or LLMM1 on gfx10.** They build for gfx1030 but
+  assert on the device.
+- **Disable kernels through the registry.** Use `VLLM_DISABLED_KERNELS=<Class>`;
+  do not add per-kernel `VLLM_DISABLE_*` env vars. Prefer flags that travel
+  through the vLLM config (CLI / `--additional-config`) over env-only knobs:
+  engine-core and worker processes do not always see the caller's environment.
+- **Cudagraphs are the production path.** Serving runs `FULL_AND_PIECEWISE`;
+  a change must stay correct both there and under `--enforce-eager`, and any
+  speed change needs an A/B against the current branch.
+- **Benchmarks report four numbers per cell:** prefill tok/s, decode tok/s per
+  request, TTFT (s) and ITL (ms), for 16k/1k and 1k/512 at c=1 and c=8.
+
 ### Where RDNA docs live
 
 | Topic | Location |
