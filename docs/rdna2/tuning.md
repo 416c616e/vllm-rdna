@@ -113,7 +113,7 @@ actually sets.
 | `VLLM_RDNA_AR_BLOCKS`, `_PACE`, `_WAIT_MS` | auto, 0, — | Block cap, pacing, and peer-flag wait timeout. |
 | `VLLM_FORCE_CUSTOM_ALL_REDUCE` | 0 | Stock custom AR past the XGMI gates. **Keep 0**: it has crashed the host (PCI SERR). |
 | `NCCL_P2P_LEVEL=pxb`, `NCCL_PROTO=Simple`, `RCCL_P2P_NET_DISABLE=1`, `RCCL_P2P_BATCH_ENABLE=1`, `RCCL_MSCCL_ENABLE=0` | | RCCL settings for RDNA PCIe. LL/LL128 can deadlock. |
-| `GPU_MAX_HW_QUEUES` | launcher 2 | RDNA2 has 8 HQDs per GPU. 4 (HIP default) oversubscribes. |
+| `GPU_MAX_HW_QUEUES` | launcher 2 (flashnext TP4 recipes 4) | HIP streams per process; RDNA2 has 8 HQDs per GPU. Flash-Next TP4: 4 is neutral with the fork kernels off (MTP0/MTP2, 1k/16k, c=1/c=8; no "Runlist is getting oversubscribed") and fixes a per-rank skew from queue sharing at 2 when the persistent `rdna_mono_*` kernels are in the graph (2026-10-16). Other recipes keep 2 until measured. |
 
 ### Scheduler
 
