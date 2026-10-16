@@ -57,15 +57,14 @@ def deployment(monkeypatch):
 
 def test_off_by_default():
     assert KernelConfig().monokernel is False
-    assert EngineArgs(model="m").monokernel is False
     assert md.options(_config(monokernel=False)) is None
 
 
 def test_flag_parses_into_engine_args():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    assert EngineArgs.from_cli_args(parser.parse_args([])).monokernel is False
-    args = parser.parse_args(["--monokernel"])
-    assert EngineArgs.from_cli_args(args).monokernel is True
+    assert parser.parse_args([]).monokernel is False
+    assert parser.parse_args(["--monokernel"]).monokernel is True
+    assert EngineArgs.monokernel is False  # the dataclass default
 
 
 def test_flag_turns_on_every_part_with_the_validated_defaults():

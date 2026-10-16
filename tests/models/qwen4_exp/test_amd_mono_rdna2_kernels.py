@@ -211,7 +211,7 @@ def _inputs(M, seed):
 
 
 def _check_k2(L, G, got, res, blk, inj):
-    out, ro, io = got
+    ro, out, io = got  # k2.run: (residual, partial FFN output, injection)
     o_ref, ro_ref, io_ref = _today_ffn(L, res, blk, inj)
     torch.accelerator.synchronize()
     rowd = (out.float() - o_ref.float()).abs().max(1).values
