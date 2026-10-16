@@ -146,7 +146,6 @@ class CompressedTensorsWNA16RDNA2MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         # Pre-allocate reusable buffers for decode (sizes based on top_k=8)
         N_gate_up = w13_N
-        hidden_size = w2_N
         intermediate = N_gate_up // 2  # gated activation
         # Max tokens we expect in decode; prefill will re-allocate if needed
         max_decode_tokens = 16
@@ -157,9 +156,6 @@ class CompressedTensorsWNA16RDNA2MoEMethod(CompressedTensorsWNA16MoEMethod):
         )
         layer.rdna2_act_buf = torch.empty(
             buf_size, intermediate, dtype=act_dtype, device=device
-        )
-        layer.rdna2_out_buf = torch.zeros(
-            max_decode_tokens, hidden_size, dtype=act_dtype, device=device
         )
         layer.rdna2_empty_tw = torch.empty(0, device=device)
 
@@ -217,7 +213,6 @@ def _rdna2_fused_moe(
     Optimizations vs naive dispatch:
       - BLOCK_SIZE_M=1 for decode (no padding waste, bf16 fast path)
       - Pre-allocated buffers (no torch.zeros per call)
-      - Inline token sorting for small M (skip moe_align_block_size)
       - moe_sum fused into output accumulation
     """
     num_tokens = hidden_states.shape[0]
