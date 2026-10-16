@@ -2,7 +2,7 @@
 """Four-metric table from serve_validate bench JSONs, grouped by recipe and arm
 (directory names serve-m3-<mtp>-<arm>-<rep>), mean over reps, on/off delta.
 
-  python3 ab_table.py ~/w4a8_runs/monokernel-2a/serve-m3-*
+  python3 ab_table.py ~/w4a8_runs/mono-layout/serve-ab-*
 """
 
 import collections
@@ -35,10 +35,12 @@ def metrics(path):
 def main():
     rows = collections.defaultdict(lambda: collections.defaultdict(list))
     for run in sys.argv[1:]:
-        m = re.search(r"serve-m3-(mtp\d)-(on|off)-(\w+)$", run.rstrip("/"))
+        # serve-m3-<mtp>-<arm>-<rep> (M3) or serve-<tag>-<mtp>-<arm> (run_specs)
+        m = re.search(r"serve-(?:m3-)?(?:\w+?-)?(mtp\d)-(on|off)(?:-\w+)?$",
+                      run.rstrip("/"))
         if not m:
             continue
-        mtp, arm, _ = m.groups()
+        mtp, arm = m.groups()
         for cell in CELLS:
             f = os.path.join(run, f"bench-{cell}.json")
             if os.path.exists(f):

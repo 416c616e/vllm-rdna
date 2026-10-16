@@ -73,9 +73,11 @@ def options(vllm_config) -> Options | None:
 
 
 def is_qwen4exp(vllm_config) -> bool:
+    """Qwen4Exp, or its MTP drafter (the speculative config builds its own
+    VllmConfig, which carries the flag too; the drafter keeps its modules)."""
     model_config = getattr(vllm_config, "model_config", None)
     archs = getattr(model_config, "architectures", None) or ()
-    return any(a.startswith("Qwen4Exp") and "MTP" not in a for a in archs)
+    return any(a.startswith("Qwen4Exp") for a in archs)
 
 
 def _on_gfx10x() -> bool:

@@ -146,6 +146,12 @@ def test_unsupported_deployment_is_refused(monkeypatch, deployment, patch, cfg, 
         md.install(_config(**cfg))
 
 
+def test_mtp_drafter_config_is_accepted(deployment):
+    """The MTP drafter's own VllmConfig (arch Qwen4ExpMTP) carries the flag."""
+    md.check_config(_config(arch="Qwen4ExpMTP"))
+    assert md.config_refusal(_config(arch="Qwen4ExpMTP")) is None
+
+
 def test_missing_ops_are_named(monkeypatch):
     monkeypatch.setattr(md, "REQUIRED_OPS", ("mono_does_not_exist_rdna2",))
     assert "mono_does_not_exist_rdna2" in md.ops_refusal()
