@@ -103,6 +103,7 @@ __global__ void __launch_bounds__(kThreads) qsa_dec_k(const Args a) {
   __syncthreads();
   const long base = (long)split * a.M + row;
   __shared__ int s_last;
+  __shared__ float s_L[kMaxG], s_M[kMaxG];  // split partial, then merge weights
   if (s_empty) {
     if (tid < G) a.plse[base * a.QH + h0 + tid] = -INFINITY;
   } else {
@@ -216,7 +217,6 @@ __global__ void __launch_bounds__(kThreads) qsa_dec_k(const Args a) {
     __syncthreads();
   }
   // this split's partial: o = acc / L, lse = M + log2 L  (L = 0: empty split)
-  __shared__ float s_L[kMaxG], s_M[kMaxG];
   if (tid < G) {
     float mm = -1.0e20f;
     for (int w = 0; w < kWaves; w++) mm = fmaxf(mm, s_m[w][tid]);
