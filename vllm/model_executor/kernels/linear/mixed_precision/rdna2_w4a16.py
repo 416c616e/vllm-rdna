@@ -49,20 +49,6 @@ W4A8_ENV_VAR = "VLLM_RDNA2_W4A8_SDOT4"
 W4A8_MIN_ROWS = 33
 
 
-def _awq_prefill_available() -> bool:
-    """Check if the AWQ-native prefill kernel is registered.
-
-    hasattr(torch.ops._rocm_C, ...) is unreliable for torch ops because
-    dir() only shows 'name' for the namespace object. Use a direct
-    attribute access in a try/except instead.
-    """
-    try:
-        torch.ops._rocm_C.awq_gemm_rdna2_prefill  # noqa: B018 - probe op
-        return True
-    except AttributeError:
-        return False
-
-
 def _w4a8_lds_fits(k: int, group_size: int) -> bool:
     """Mirror of pick_split_k: some group-aligned split <= 16 fits M_TILE=8
     rows of K plus the per-(token, group) scales in 64 KiB of LDS.
@@ -170,10 +156,6 @@ def _rdna2_w4a16_gemm(
         # gptq_gemm_rdna2_prefill. No post-call test, no env access, no
         # logging in the traced region.
         output = ops.w4a8_gemm_rdna2(x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-    elif kernel_name == "awq_prefill" and hasattr(ops, "awq_gemm_rdna2_prefill"):
-        output = ops.awq_gemm_rdna2_prefill(
-            x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
-        )
     elif kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
         output = ops.gptq_gemm_rdna2_prefill(
             x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
@@ -183,11 +165,7 @@ def _rdna2_w4a16_gemm(
     elif kernel_name == "rdna2_decode" and hasattr(ops, "gptq_gemm_rdna2"):
         output = ops.gptq_gemm_rdna2(x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
     else:
-        if hasattr(ops, "awq_gemm_rdna2_prefill") and use_v2_format:
-            output = ops.awq_gemm_rdna2_prefill(
-                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
-            )
-        elif hasattr(ops, "gptq_gemm_rdna2_prefill"):
+        if hasattr(ops, "gptq_gemm_rdna2_prefill"):
             output = ops.gptq_gemm_rdna2_prefill(
                 x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
             )
