@@ -72,10 +72,10 @@ the selected rows path; harvest into the profile directory when validated).
   helper uses it automatically when the selected build has no rows, and it is
   where online tuning writes.
 
-All serve launchers under `scripts/` (through `scripts/rdna_launcher_common.sh`)
-and the in-tree bench/capture drivers go through this helper (or the
-`tools/rdna2/` mirror); a launcher with a `TUNABLEOP=0` opt-out sets
-`PYTORCH_TUNABLEOP_ENABLED=0` and writes nothing.
+All serve launchers under `tools/rdna/` (through
+`tools/rdna/rdna_launcher_common.sh`) and the in-tree bench/capture drivers
+go through this helper (or the `tools/rdna2/` mirror); a launcher with a
+`TUNABLEOP=0` opt-out sets `PYTORCH_TUNABLEOP_ENABLED=0` and writes nothing.
 
 ## Cache-aligned prefill
 
