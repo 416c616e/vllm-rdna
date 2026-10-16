@@ -18,7 +18,6 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
-import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -184,39 +183,6 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
-
-# --- DEBUG: per-step phase timing (gated by DBG_VLLM_STEP_TIMING=1) ---
-_DBG_STEP_TIMING = os.environ.get("DBG_VLLM_STEP_TIMING") == "1"
-_dbg_phase_ns: dict[str, float] = {}
-
-
-class _DbgPhase:
-    __slots__ = ("_name", "_t0")
-
-    def __init__(self, name: str):
-        self._name = name
-        self._t0 = 0.0
-
-    def __enter__(self):
-        if _DBG_STEP_TIMING:
-            self._t0 = time.perf_counter_ns()
-        return self
-
-    def __exit__(self, *args):
-        if _DBG_STEP_TIMING:
-            dt = time.perf_counter_ns() - self._t0
-            _dbg_phase_ns[self._name] = _dbg_phase_ns.get(self._name, 0) + dt
-
-
-def _dbg_flush_step(rank: int, step: int) -> None:
-    if not _DBG_STEP_TIMING or not _dbg_phase_ns:
-        return
-    parts = " ".join(f"{p}={v / 1e3:.1f}us" for p, v in _dbg_phase_ns.items())
-    logger.info("[STEP_TIMING rank=%d step=%d] %s", rank, step, parts)
-    _dbg_phase_ns.clear()
-
-
-_dbg_step_count = 0
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1290,22 +1256,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            if os.environ.get("VLLM_BT_DEBUG", "0") == "1":
-                logger.warning(
-                    "[zero-debug] zero=%s", scheduler_output.new_block_ids_to_zero
-                )
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
-            if os.environ.get("VLLM_BT_DEBUG", "0") == "1":
-                logger.warning(
-                    "[cow-debug] copies=%s zero=%s",
-                    scheduler_output.kv_cache_block_copies,
-                    scheduler_output.new_block_ids_to_zero,
-                )
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
                 self.kv_cache_config.num_blocks,
@@ -1873,13 +1829,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # re-gathered every step, so under PP a deferred postprocess on a
             # non-last rank would walk another step's batch mapping through
             # freed/reallocated block ids. (Port of vllm-project/vllm#55506.)
-            with _DbgPhase("preprocess"):
-                self.model_state.preprocess_state(
-                    input_batch,
-                    tuple(bt.gpu for bt in self.block_tables.block_tables),
-                    self.kv_cache_config,
-                    self.req_states.num_computed_tokens.gpu,
-                )
+            self.model_state.preprocess_state(
+                input_batch,
+                tuple(bt.gpu for bt in self.block_tables.block_tables),
+                self.kv_cache_config,
+                self.req_states.num_computed_tokens.gpu,
+            )
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -2048,7 +2003,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
-        _dbg_forward_t0 = time.perf_counter_ns() if _DBG_STEP_TIMING else 0.0
         if phase_timer is not None and not dummy_run:
             phase_timer.start(input_batch.num_tokens)
 
@@ -2152,10 +2106,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
-        if _DBG_STEP_TIMING:
-            _dbg_phase_ns["forward"] = _dbg_phase_ns.get("forward", 0) + (
-                time.perf_counter_ns() - _dbg_forward_t0
-            )
         if phase_timer is not None and not dummy_run:
             phase_timer.mark("forward")
         if sync_debug is not None and not dummy_run:
@@ -2188,7 +2138,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
-        global _dbg_step_count
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
@@ -2222,10 +2171,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             # The first PP rank holds the encoder cache, so pass its EC output on.
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-            if _DBG_STEP_TIMING:
-                global _dbg_step_count
-                _dbg_step_count += 1
-                _dbg_flush_step(os.getpid(), _dbg_step_count)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
@@ -2387,9 +2332,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
-        if _DBG_STEP_TIMING:
-            _dbg_step_count += 1
-            _dbg_flush_step(os.getpid(), _dbg_step_count)
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2414,10 +2356,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-            if _DBG_STEP_TIMING:
-                global _dbg_step_count
-                _dbg_step_count += 1
-                _dbg_flush_step(os.getpid(), _dbg_step_count)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         assert self.pooling_runner is not None
