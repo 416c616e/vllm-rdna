@@ -3,6 +3,57 @@
 > These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
 
+## 0. RDNA fork (read first)
+
+This repository is the **opengfx1030** fork of vLLM for AMD **RDNA2 (gfx1030)**
+and related RDNA GPUs. The default branch is `rdna_extras` (upstream v0.31.0 plus
+the RDNA port). Sections 1-2 below are upstream's rules and still apply here.
+
+1. Read the community wiki: https://blivioniag.github.io/gfx1030-wiki/
+2. Prefer a **host venv** over Hub Docker images for Flash-Next or current kernels
+   (published tags lag `rdna_extras`).
+3. Serve through the in-tree launcher. Do **not** write a fresh `vllm serve`
+   argv from memory:
+
+```bash
+MODEL=/path/to/checkpoint VENV=/path/to/venv \
+  bash tools/rdna/serve_rdna.sh RECIPE=<name>
+```
+
+- Dry-run: `PRINT=1 bash tools/rdna/serve_rdna.sh RECIPE=<name>` prints the
+  environment, the TunableOp profile and the exact command.
+- Recipes live in `tools/rdna/recipes/*.env`: `flashnext`, `flashnext-mtp0`,
+  `flashnext-mtp2`, `flashnext-pp3`, `flashnext-pp3-mtp2`, `27b-awq`,
+  `27b-exl3`, `dsv4-flash`, `full`. Override any key with a trailing
+  `KEY=value`; pass extra vLLM flags with `EXTRA_ARGS='...'`
+  (for example `EXTRA_ARGS=--monokernel`).
+- Flash-Next PLE table: `PLE=bf16` (default, ~95 GB host RAM), `PLE=int4` or
+  `PLE=int4-disk` with `PLE_QUANT_DIR=/path/to/ples_int4`.
+
+### Common mistakes
+
+- Building Hub/Dockerfile images with `VLLM_REF=main` and expecting Flash-Next:
+  use a host checkout and the launcher.
+- Pasting old env dumps that set `VLLM_USE_BREAKABLE_CUDAGRAPH=1` on Flash-Next.
+  Only the recipes that need it (`dsv4-flash`, `full`) set it.
+- Using BF16 on RDNA2: gfx1030 has no BF16 dot instructions, serve with
+  `--dtype float16`.
+- Enabling AITER or CK backends: they are CDNA-only. Keep `VLLM_ROCM_USE_AITER=0`.
+
+### Where RDNA docs live
+
+| Topic | Location |
+|---|---|
+| Human wiki (setup, recipes, troubleshooting) | https://blivioniag.github.io/gfx1030-wiki/ |
+| Serve launcher and recipes | `tools/rdna/serve_rdna.sh`, `tools/rdna/recipes/` |
+| Kernel and V620 notes | `docs/rdna2/` |
+| TunableOp profiles | `tunableop/` |
+
+Do not invent tok/s or hardware claims. Prefer editing a recipe over hard-coding
+host paths.
+
+---
+
 ## 1. Contribution Policy (Mandatory)
 
 ### Duplicate-work checks
@@ -13,6 +64,14 @@ Before proposing a PR, run these checks:
 gh issue view <issue_number> --repo vllm-project/vllm --comments
 gh pr list --repo vllm-project/vllm --state open --search "<issue_number> in:body"
 gh pr list --repo vllm-project/vllm --state open --search "<short area keywords>"
+```
+
+For work on this fork, also check its own issues and PRs (including `[backlog]`
+drafts):
+
+```bash
+gh pr list --repo opengfx1030/vllm-rdna --state open --search "<short area keywords>"
+gh issue list --repo opengfx1030/vllm-rdna --state open --search "<short area keywords>"
 ```
 
 - If an open PR already addresses the same fix, do not open another.
@@ -63,6 +122,11 @@ pre-commit install
 # Start with precompiled artifacts for an editable install:
 VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
 ```
+
+On this fork the precompiled artifacts do not help: they are CUDA builds. For
+RDNA, build the ROCm extensions from source in a venv that has a ROCm PyTorch
+(`VLLM_TARGET_DEVICE=rocm`, `PYTORCH_ROCM_ARCH=gfx1030`); the wiki has the full
+recipe.
 
 For C/C++ or CUDA changes, follow the
 [incremental compilation workflow](docs/contributing/incremental_build.md) to
