@@ -6,9 +6,8 @@
 // for RDNA3 (csrc/rocm/q_gemm_rdna3.cu) with the following changes:
 //
 //   1. Decode only. M_COUNT ∈ {1, 2, 4, 8} covers M ∈ [1, 15] in
-//      tiles; M >= 16 (prefill) is not in scope and falls through to
-//      Triton W4A16. gfx1030 has no WMMA ISA (that landed on RDNA3,
-//      gfx1100+), so the prefill path on gfx1030 is Triton regardless.
+//      tiles. Prefill is gptq_gemm_rdna2_prefill. gfx1030 has no WMMA
+//      ISA (that landed on RDNA3, gfx1100+).
 //
 //   2. Direct write to f16 output via packed CAS-loop on a 64-bit
 //      word (atomic_add_pk4_f16). gfx1030 has no native
@@ -23,8 +22,8 @@
 //      computing 4 N output columns. gridDim.z = K / BLOCK_KN_SIZE
 //      splits K and the output is atomically accumulated. fp16 uses
 //      v_dot2_f32_f16 (__builtin_amdgcn_fdot2) directly. M_COUNT ∈ {1, 2,
-//      4, 8} is selected at launch based on size_m; M >= 16 falls
-//      through to Triton.
+//      4, 8} is selected at launch based on size_m. Prefill is
+//      gptq_gemm_rdna2_prefill.
 
 #include <cstdint>
 #include <cstdio>
@@ -247,9 +246,7 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
 }
 // Dispatch to the largest M_COUNT template that doesn't waste more than
 // half a tile. Caps at 8: above that, larger M_COUNT wastes too many
-// thread slots; the public entry point's caller is expected to dispatch
-// M >= 16 to a separate path (Triton W4A16 on gfx1030, since gfx1030 has
-// no WMMA).
+// thread slots. Prefill is gptq_gemm_rdna2_prefill.
 //
 // Tile-waste table:
 //   M=1   -> M_COUNT=1   (no waste)

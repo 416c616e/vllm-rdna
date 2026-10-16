@@ -78,7 +78,6 @@ actually sets.
 | `VLLM_RDNA_DENSE_INT8`, `_ONLY`, `_MIN_ROWS` | 0, 0, 64 | int8 weight-only shadow copies of dense fp16 projections for decode. Off in all recipes. |
 | `VLLM_RDNA_DENSE_GEMV` | 0 | Force `gemv_f16_rdna2` for n ≤ 5. **Never route anything to wvSplitK on gfx1030**: it asserts on device. |
 | `VLLM_DISABLED_KERNELS` | — | Upstream registry: e.g. `RDNA2W4A16LinearKernel` to fall back to Triton/Exllama. |
-| `VLLM_RDNA2_PREFILL_FORCE_CONFIG`, `_FORCE_SPLIT_K` | -1 | Pin the W4A16 HIP prefill tile/split-K (kernel A/B only). |
 
 ### MoE
 

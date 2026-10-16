@@ -39,7 +39,6 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <tuple>
 #include <type_traits>
 
@@ -51,12 +50,6 @@ constexpr int kKP = kKT / 2;  // k-pairs per slab
 
 __device__ __forceinline__ float sigmoid_f(float x) {
   return __builtin_amdgcn_rcpf(1.f + __expf(-x));
-}
-
-// Benchmark override: VLLM_RDNA_HC_PREFILL_<name>=<int>, read once.
-int env_int(const char* name) {
-  const char* e = std::getenv(name);
-  return e ? std::atoi(e) : -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -384,8 +377,7 @@ void dispatch_up_mix(cudaStream_t st, const TA* dai, int ld, const half* w,
                      const half* xn, half* out, half* dai16, int n_dai, int M,
                      int H, int R) {
   // Tile: enough blocks to fill 72 CUs at small M, more W_up reuse at large M.
-  static const int forced = env_int("VLLM_RDNA_HC_PREFILL_TILE");
-  const int sel = forced >= 0 ? forced : (M <= 64 ? 0 : (M <= 384 ? 1 : 2));
+  const int sel = M <= 64 ? 0 : (M <= 384 ? 1 : 2);
   switch (sel) {
     case 0:
       launch_up_mix<TA, 8, 4, 2>(st, dai, ld, w, xn, out, dai16, n_dai, M, H,
@@ -407,8 +399,7 @@ void launch_down(cudaStream_t st, const half* A, int lda, const half* B,
                  int ldb, float* C, int M, int N, int K, int target_blocks) {
   constexpr int BM = TY * TM, BN = 16 * NC;
   const int mn = ((N + BN - 1) / BN) * ((M + BM - 1) / BM);
-  static const int forced = env_int("VLLM_RDNA_HC_PREFILL_SPLIT");
-  int splits = forced > 0 ? forced : (target_blocks + mn / 2) / mn;
+  int splits = (target_blocks + mn / 2) / mn;
   splits = std::max(1, std::min(splits, 16));
   const int kps = ((K + splits - 1) / splits + kKT - 1) / kKT * kKT;
   const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, (K + kps - 1) / kps);
