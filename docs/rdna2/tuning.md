@@ -220,6 +220,10 @@ Cache/scheduler traces: `VLLM_DEBUG_PREFIX_HIT`, `VLLM_TRACE_PREFIX_CACHE`,
 `VLLM_RDNA_SYNC_DEBUG`, `DBG_VLLM_STEP_TIMING`. Graph-pool memory:
 `VLLM_RDNA_POOLWATCH` (+ `_HISTORY`, `_DUMP_ON_REPLAY`). PLE sidecar:
 `PLE_OFFLOAD_DEBUG_{HOPS,TRACE,DELAY_MS}`, `PLE_OFFLOAD_FUSED_CHECK`.
+GPU profiling: the launchers set `ROCPROFILER_REGISTER_ENABLED=0`, so the HIP/HSA
+runtimes never register with rocprofiler (no tool init, no queue interception)
+while serving. Set `ROCPROFILER_REGISTER_ENABLED=1` for torch-profiler or
+rocprofv3 GPU traces.
 
 ## TunableOp
 

@@ -80,6 +80,10 @@ rdna_init() {
     export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-${GPUIDS:-0,1,2,3}}
     export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
     export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-2}
+    # Serving never attaches a GPU profiler: keep the HIP/HSA runtimes from
+    # registering with rocprofiler (no tool init, no queue interception).
+    # Profiling runs set ROCPROFILER_REGISTER_ENABLED=1.
+    export ROCPROFILER_REGISTER_ENABLED=${ROCPROFILER_REGISTER_ENABLED:-0}
     export VLLM_ROCM_USE_AITER=${VLLM_ROCM_USE_AITER:-0}
     export VLLM_ROCM_USE_AITER_MOE=${VLLM_ROCM_USE_AITER_MOE:-0}
     export VLLM_RDNA_FORCE_FP16=${VLLM_RDNA_FORCE_FP16:-1}

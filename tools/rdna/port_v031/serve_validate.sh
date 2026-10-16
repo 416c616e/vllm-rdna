@@ -55,6 +55,7 @@ export LD_LIBRARY_PATH=$SITE/_rocm_sdk_libraries/lib:$SITE/_rocm_sdk_core/lib/ho
 CACHE=${CACHE:-$HOME/w4a8_runs/port-v031/cache-$TAG}
 export VLLM_CACHE_ROOT=$CACHE/vllm TRITON_CACHE_DIR=$CACHE/triton
 export TORCHINDUCTOR_CACHE_DIR=$CACHE/inductor
+export ROCPROFILER_REGISTER_ENABLED=${ROCPROFILER_REGISTER_ENABLED:-0}  # bench clients too
 
 if [[ ${STALL_PROBE:-0} == 1 && ${STALL_ITER_LOG:-1} == 1 ]]; then
     export EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--enable-logging-iteration-details"
