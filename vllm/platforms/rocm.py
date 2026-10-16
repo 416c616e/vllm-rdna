@@ -1131,6 +1131,17 @@ class RocmPlatform(Platform):
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
 
+        # MonoKernel: VLLM_ROCM_MONO_DECODE=1 is an alias of --monokernel (the
+        # env does not reach the workers; the config does). Refuse a
+        # deployment the Qwen4Exp RDNA2 MonoKernel cannot run, here already.
+        kernel_config = getattr(vllm_config, "kernel_config", None)
+        if kernel_config is not None and envs.VLLM_ROCM_MONO_DECODE:
+            kernel_config.monokernel = True
+        if kernel_config is not None and kernel_config.monokernel:
+            from vllm.models.qwen4_exp.amd.mono_decode_rdna2 import check_config
+
+            check_config(vllm_config)
+
         # gfx10x: VLLM_USE_RDNA2_FA=1 opts into the standalone FA-RDNA2
         # backend, but the flag cannot reach the engine-core and worker
         # processes (their environment is replaced at spawn). Pin the backend

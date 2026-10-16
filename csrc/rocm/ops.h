@@ -53,10 +53,12 @@ at::Tensor rdna_hc_up_gate_mix_prefill(const at::Tensor& dai,
                                        const at::Tensor& w_up,
                                        const at::Tensor& xn,
                                        int64_t lora_rank, int64_t hc_count);
-// MonoKernel 2a: one persistent launch for the Qwen4Exp decode FFN block.
-int64_t mono_ffn_rdna2_workspace_bytes(int64_t H, int64_t R, int64_t ND,
+// Qwen4Exp RDNA2 MonoKernel (vllm/models/qwen4_exp/amd/mono/rdna2/): K2 = the
+// decode FFN block in one persistent launch, K1 = the attention-side HC
+// preamble, GDN = fused GDN decode core, QSA = sparse decode attention.
+int64_t mono_k2_rdna2_workspace_bytes(int64_t H, int64_t R, int64_t ND,
                                        int64_t E, int64_t Ise, int64_t I);
-void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
+void mono_k2_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                     const torch::Tensor& inj, const torch::Tensor& norm_w,
                     const torch::Tensor& wd, const torch::Tensor& wu,
                     const torch::Tensor& wr, const torch::Tensor& se_w1,
@@ -68,12 +70,12 @@ void mono_ffn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                     torch::Tensor& out, torch::Tensor& workspace,
                     int64_t expert_base, int64_t zero_offset, int64_t num_wg,
                     double eps, double timeout_ms);
-torch::Tensor mono_ffn_rdna2_error(const torch::Tensor& workspace);
-void mono_ffn_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width);
-torch::Tensor mono_ffn_rdna2_workspace_alloc(int64_t nbytes, int64_t device);
-int64_t mono_ffn_rdna2_mem_flags(const torch::Tensor& t);
-int64_t mono_ffn_rdna2_set_ar(int64_t handle, int64_t device);
-void mono_gdn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
+torch::Tensor mono_k2_rdna2_error(const torch::Tensor& workspace);
+void mono_k2_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width);
+torch::Tensor mono_k2_rdna2_workspace_alloc(int64_t nbytes, int64_t device);
+int64_t mono_k2_rdna2_mem_flags(const torch::Tensor& t);
+int64_t mono_k2_rdna2_set_ar(int64_t handle, int64_t device);
+void mono_k2_rdna2_e1a(const torch::Tensor& res, const torch::Tensor& blk,
                     const torch::Tensor& inj, const torch::Tensor& norm_w,
                     const torch::Tensor& wd, const torch::Tensor& wu,
                     const torch::Tensor& wq, const torch::Tensor& wba,
@@ -85,7 +87,7 @@ void mono_gdn_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                     torch::Tensor& inj_out, torch::Tensor& out, torch::Tensor& workspace,
                     int64_t num_wg, double eps, double gn_eps, int64_t gn_sigmoid,
                     double scale, double timeout_ms);
-void gdn_fused_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
+void mono_gdn_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
                      const torch::Tensor& conv_w, const torch::Tensor& conv_b,
                      torch::Tensor& conv_state, torch::Tensor& ssm_state,
                      const torch::Tensor& A_log, const torch::Tensor& dt_bias,
@@ -93,14 +95,14 @@ void gdn_fused_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
                      const torch::Tensor& nacc, const torch::Tensor& qsl,
                      torch::Tensor& y, torch::Tensor& scratch, int64_t num_k_heads,
                      double scale, double eps, int64_t gate_sigmoid);
-int64_t gdn_fused_rdna2_scratch_bytes(int64_t M, int64_t HV, int64_t H);
-void qsa_decode_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
+int64_t mono_gdn_rdna2_scratch_bytes(int64_t M, int64_t HV, int64_t H);
+void mono_qsa_decode_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
                       const torch::Tensor& v_cache, const torch::Tensor& indices,
                       const torch::Tensor& block_table, const torch::Tensor& token_to_req,
                       torch::Tensor& out, torch::Tensor& scratch, torch::Tensor& counters,
                       int64_t splits);
-int64_t qsa_decode_rdna2_splits(int64_t M, int64_t KVH, int64_t W);
-void mono_hc_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
+int64_t mono_qsa_decode_rdna2_splits(int64_t M, int64_t KVH, int64_t W);
+void mono_k1_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    const torch::Tensor& inj, const torch::Tensor& norm_w,
                    const torch::Tensor& wd, const torch::Tensor& wu,
                    torch::Tensor& res_out, torch::Tensor& inj_out,

@@ -133,6 +133,14 @@ class MultiprocExecutor(Executor):
         num_local_procs = self.local_world_size * max(
             1, self.parallel_config.data_parallel_size_local
         )
+        if current_platform.is_rocm() and self.vllm_config.kernel_config.monokernel:
+            # gfx10x MonoKernel: HW-queue budget for the workers (env, read at
+            # HIP init in each worker, so it must be set before the spawn).
+            from vllm.models.qwen4_exp.amd.mono_decode_rdna2 import (
+                set_worker_hw_queue_budget,
+            )
+
+            set_worker_hw_queue_budget(self.vllm_config)
         set_multiprocessing_worker_envs(num_local_procs)
 
         if aiter_requires_tcp_store():

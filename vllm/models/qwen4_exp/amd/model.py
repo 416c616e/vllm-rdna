@@ -79,7 +79,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import ATTENTION_LAYER_TYPES, QSA_LAYER_TYPE, Qwen4ExpConfig
-from . import mono_ffn
+from . import mono_decode_rdna2
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
@@ -277,20 +277,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
 
-        # MonoKernel 2a (opt-in): the decode FFN block in one persistent launch.
-        # Main-model MoE layers only; the MTP drafter keeps its modules.
-        self._mono_ffn = None
-        if (
-            is_moe_layer
-            and ".mtp." not in f".{prefix}."
-            and mono_ffn.mono_ffn_requested(vllm_config)
-            and mono_ffn.mono_ffn_supported(vllm_config)
-        ):
-            self._mono_ffn = mono_ffn.MonoFFN(self)
-            self._mono_name = f"{prefix}.mono_ffn"
-            vllm_config.compilation_config.static_forward_context[self._mono_name] = (
-                self._mono_ffn
-            )
+        # --monokernel (gfx10x): forward-context names of this layer's K1 / K2
+        self._mono_k1, self._mono_k2 = mono_decode_rdna2.layer_hook(
+            self, vllm_config, prefix, is_moe_layer
+        )
 
     def forward(
         self,
@@ -323,10 +313,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
-        if self._mono_ffn is not None and (mono_ffn.timing_enabled() or mono_ffn.hc_enabled()):
-            # K1 (rdna_mono_hc) and/or serve timing: the HC call inside an opaque op
-            hidden_states, block_input, injection = torch.ops.vllm.rdna_mono_attn_hc(
-                hidden_states, prev_block_output, prev_injection, self._mono_name
+        if self._mono_k1 is not None:
+            hidden_states, block_input, injection = (
+                torch.ops.vllm.qwen4_exp_mono_k1_rdna2(
+                    hidden_states, prev_block_output, prev_injection, self._mono_k1
+                )
             )
         elif prev_block_output is not None and prev_injection is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
@@ -356,9 +347,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
 
-        if self._mono_ffn is not None:
-            return torch.ops.vllm.rdna_mono_ffn_block(
-                hidden_states, attn_out, injection, self._mono_name
+        if self._mono_k2 is not None:
+            return torch.ops.vllm.qwen4_exp_mono_k2_rdna2(
+                hidden_states, attn_out, injection, self._mono_k2
             )
 
         mlp_hc = self.mlp_hyper_connection
@@ -473,6 +464,7 @@ class Qwen4ExpModel(nn.Module):
             )
         )
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        mono_decode_rdna2.install(vllm_config)  # --monokernel: checks + hooks
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)

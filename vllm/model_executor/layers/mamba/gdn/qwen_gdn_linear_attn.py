@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
-import functools
 import os
 from typing import Any, Literal
 
@@ -95,6 +94,11 @@ if GDN_AITER_TRITON_AVAILABLE:
     )
 
 logger = init_logger(__name__)
+
+# Set by a model MonoKernel (--monokernel; Qwen4Exp RDNA2:
+# vllm/models/qwen4_exp/amd/mono/rdna2/gdn.py) before its layers are built:
+# hook(layer, vllm_config) -> (decode-core custom op, per-layer state) or None.
+MONO_GDN_HOOK: Any = None
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
@@ -640,185 +644,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if mode is not None and bool(mode) and on_rdna_family():
             self._init_gdn_state_arenas()
 
-        # MonoKernel E1' (gfx1030): the decode core (conv update + delta rule +
-        # gated RMSNorm) in one launch, additional_config "rdna_mono_gdn"
-        extra = getattr(vllm_config, "additional_config", None) or {}
-        self._mono_gdn = (
-            isinstance(extra, dict)
-            and bool(extra.get("rdna_mono_gdn", False))
-            and self._mono_gdn_supported()
-        )
-        self._mono_gdn_cache: tuple | None = None
-        # capture the fused kernel inside FULL graphs instead of an eager break
-        self._mono_gdn_graph = self._mono_gdn and bool(
-            isinstance(extra, dict) and extra.get("rdna_mono_gdn_graph", False)
-        )
-        self._mono_gdn_max_rows = (
-            min(64, int(extra.get("rdna_mono_gdn_max_rows", 64)))
-            if isinstance(extra, dict)
-            else 64
-        )
+        mono = MONO_GDN_HOOK(self, vllm_config) if MONO_GDN_HOOK else None
+        self._mono_gdn_op, self._mono_gdn = mono if mono else (None, None)
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-
-    def _mono_gdn_supported(self) -> bool:
-        from vllm.platforms.rocm import on_gfx10x
-
-        if not (current_platform.is_rocm() and on_gfx10x()):
-            return False
-        import vllm._custom_ops  # noqa: F401  (loads _rocm_C)
-
-        why = None
-        if not hasattr(torch.ops._rocm_C, "gdn_fused_rdna2"):
-            why = "op not built"
-        elif self.gqa_interleaved_layout or self.disable_tp_for_ba_proj:
-            why = "interleaved qkvz / replicated ba layout"
-        elif self.head_k_dim != 128 or self.head_v_dim != 128:
-            why = "head dims != 128"
-        elif self.conv_kernel_size != 4 or self.activation not in ("silu", "swish"):
-            why = "conv width / activation"
-        elif self.norm.activation not in ("silu", "swish", "sigmoid"):
-            why = "norm gate activation"
-        if why is not None:
-            logger.info_once("rdna_mono_gdn requested but unsupported: %s", why)
-            return False
-        logger.info_once("rdna_mono_gdn: fused GDN decode core enabled")
-        return True
-
-    def _mono_gdn_setup(self, device: torch.device) -> tuple:
-        """fp32 A_log / dt_bias, 2-D conv weight and a zeroed scratch, built on
-        the first (eager, profile-run) call so nothing allocates under capture."""
-        if self._mono_gdn_cache is None:
-            H = self.num_k_heads // self.tp_size
-            HV = self.num_v_heads // self.tp_size
-            nbytes = int(torch.ops._rocm_C.gdn_fused_rdna2_scratch_bytes(64, HV, H))
-            conv_w = self.conv1d.weight.view(
-                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-            )
-            self._mono_gdn_cache = (
-                self.A_log.detach().float().contiguous(),
-                self.dt_bias.detach().float().contiguous(),
-                conv_w.contiguous() if not conv_w.is_contiguous() else conv_w,
-                self.conv1d.bias
-                if self.conv1d.bias is not None
-                else torch.empty(0, dtype=torch.float16, device=device),
-                torch.zeros(nbytes, dtype=torch.uint8, device=device),
-                torch.empty(0, dtype=torch.int32, device=device),
-                H,
-                1 if self.norm.activation == "sigmoid" else 0,
-            )
-        return self._mono_gdn_cache
-
-    def _mono_gdn_eligible(self, md: GDNAttentionMetadata, qkvz: torch.Tensor) -> bool:
-        if md.num_prefills > 0 or md.num_actual_tokens > self._mono_gdn_max_rows:
-            return False
-        if (
-            qkvz.dtype != torch.float16
-            or self.kv_cache[0].dtype != torch.float16
-            or self.kv_cache[1].dtype != torch.float32
-            or self.norm.weight.dtype != torch.float16
-            or self.conv1d.weight.dtype != torch.float16
-        ):
-            return False
-        if md.spec_sequence_masks is None:  # pure non-spec decode
-            idx = md.non_spec_state_indices_tensor
-            return md.num_decodes > 0 and idx is not None and idx.dtype == torch.int32
-        # pure MTP verify
-        idx = md.spec_state_indices_tensor
-        return (
-            md.num_decodes == 0
-            and md.num_spec_decodes > 0
-            and idx is not None
-            and idx.dtype == torch.int32
-            and idx.size(1) <= 8
-            and md.num_accepted_tokens is not None
-            and md.spec_query_start_loc is not None
-        )
-
-    def _mono_gdn_capturable(self, md: GDNAttentionMetadata, qkvz: torch.Tensor) -> bool:
-        """The fused path may be recorded into a FULL graph: every replay of it
-        is a same-shape pure decode / verify batch read from the builder's
-        static buffers (padding rows carry NULL_BLOCK_ID and are skipped)."""
-        if not self._mono_gdn_eligible(md, qkvz):
-            return False
-        if md.spec_sequence_masks is None and md.use_state_arenas:
-            # the arena gather / scatter is recorded with this step's count
-            return md.num_decodes == qkvz.shape[0]
-        return True
-
-    def _forward_core_mono(
-        self,
-        mixed_qkvz: torch.Tensor,
-        ba: torch.Tensor,
-        y: torch.Tensor,
-        graph: bool = False,
-    ) -> None:
-        """y = gated-RMSNorm(core(qkvz, ba)) for out_proj: one gdn_fused_rdna2
-        launch for pure decode / pure verify batches, today's path otherwise."""
-        cache = self._mono_gdn_setup(mixed_qkvz.device)
-        raw = get_forward_context().attn_metadata
-        md = raw.get(self.prefix) if isinstance(raw, dict) else None
-        use = md is not None and self._mono_gdn_eligible(md, mixed_qkvz)
-        if md is not None:
-            # one line per (kind, width) for decode-sized batches, one for all
-            # prefill / mixed batches
-            rows = md.num_actual_tokens if md.num_prefills == 0 else -1
-            key = (md.spec_sequence_masks is not None, rows, use)
-            if key not in _MONO_GDN_LOGGED:
-                _MONO_GDN_LOGGED.add(key)
-                logger.info(
-                    "rdna_mono_gdn: %s %s -> %s",
-                    "verify" if key[0] else "decode",
-                    f"{rows} rows" if rows >= 0 else "with prefill",
-                    "fused kernel" if use else "today's path",
-                )
-        if use:
-            alog, dtb, conv_w, conv_b, scratch, empty, H, sig = cache
-            # in a FULL graph the padded batch replays: size by the buffers
-            M = mixed_qkvz.shape[0] if graph else md.num_actual_tokens
-            conv_state = (
-                self.kv_cache[0]
-                if is_conv_state_dim_first()
-                else self.kv_cache[0].transpose(-1, -2)
-            )
-            ssm_state = self.kv_cache[1]
-            paged = (conv_state, ssm_state)
-            conv_state, ssm_state = self._bind_decode_state_arenas(
-                conv_state, ssm_state, md, md.num_decodes
-            )
-            if md.spec_sequence_masks is None:
-                sidx, nacc, qsl = md.non_spec_state_indices_tensor[:M], empty, empty
-            else:
-                n = md.spec_state_indices_tensor.shape[0] if graph else md.num_spec_decodes
-                sidx = md.spec_state_indices_tensor[:n]
-                nacc = md.num_accepted_tokens[:n]
-                qsl = md.spec_query_start_loc[: n + 1]
-            torch.ops._rocm_C.gdn_fused_rdna2(
-                mixed_qkvz[:M], ba[:M], conv_w, conv_b, conv_state, ssm_state,
-                alog, dtb, self.norm.weight, sidx, nacc, qsl, y[:M], scratch, H,
-                self.head_k_dim**-0.5, self.norm.eps, sig,
-            )
-            self._unbind_decode_state_arenas(*paged, md, md.num_decodes)
-            if y.size(0) > M:
-                y[M:].zero_()
-            return
-        # today's path: split, core, gated norm
-        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-        mixed_qkv, z = mixed_qkvz.split([qkv_size, self.value_dim // self.tp_size], dim=-1)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b, a = self.split_ba(ba)
-        core = torch.zeros(
-            (mixed_qkvz.size(0), self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=mixed_qkvz.dtype,
-            device=mixed_qkvz.device,
-        )
-        self._forward_core(
-            mixed_qkv=mixed_qkv, b=b.contiguous(), a=a.contiguous(), core_attn_out=core
-        )
-        y.copy_(self.norm(core, z).reshape(y.shape))
 
     def _init_gdn_state_arenas(self) -> None:
         """Permanent arenas on the layer device, before first BeginCapture."""
@@ -1340,20 +1172,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output, _ = self.out_proj(core_attn_out.flatten(-2))
             return output
 
-        if self._mono_gdn:
-            y = torch.empty(
-                (num_tokens, self.value_dim // self.tp_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+        if self._mono_gdn_op is not None:  # MonoKernel decode core -> out_proj input
+            y = hidden_states.new_empty((num_tokens, self.value_dim // self.tp_size))
+            self._mono_gdn_op(
+                mixed_qkvz, ba, y, layer_name=_encode_layer_name(self.prefix)
             )
-            if self._mono_gdn_graph:
-                torch.ops.vllm.qwen_gdn_attention_core_mono_g(
-                    mixed_qkvz, ba, y, layer_name=_encode_layer_name(self.prefix)
-                )
-            else:
-                torch.ops.vllm.qwen_gdn_attention_core_mono(
-                    mixed_qkvz, ba, y, layer_name=_encode_layer_name(self.prefix)
-                )
             output, _ = self.out_proj(y)
             return output
 
@@ -2625,66 +2448,6 @@ direct_register_custom_op(
     op_name="qwen_gdn_attention_core",
     op_func=qwen_gdn_attention_core,
     mutates_args=["a_or_z_out", "core_attn_out"],
-)
-
-
-_MONO_GDN_LOGGED: set = set()
-
-
-@eager_break_during_capture
-def qwen_gdn_attention_core_mono(
-    mixed_qkvz: torch.Tensor,
-    ba: torch.Tensor,
-    y: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    """MonoKernel E1': conv + recurrent attention + gated norm into ``y``."""
-    layer_name = _resolve_layer_name(layer_name)
-    self = get_forward_context().no_compile_layers[layer_name]
-    self._forward_core_mono(mixed_qkvz, ba, y)
-
-
-direct_register_custom_op(
-    op_name="qwen_gdn_attention_core_mono",
-    op_func=qwen_gdn_attention_core_mono,
-    mutates_args=["mixed_qkvz", "y"],
-)
-
-
-def qwen_gdn_attention_core_mono_g(
-    mixed_qkvz: torch.Tensor,
-    ba: torch.Tensor,
-    y: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    """MonoKernel E1' (rdna_mono_gdn_graph): like qwen_gdn_attention_core_mono,
-    but inside a FULL capture the fused kernel is recorded into the graph (no
-    eager break) when the batch is capturable; otherwise it breaks as usual."""
-    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-
-    layer_name = _resolve_layer_name(layer_name)
-    self = get_forward_context().no_compile_layers[layer_name]
-    capture = BreakableCUDAGraphCapture.current()
-    if capture is not None and capture._capturing:
-        raw = get_forward_context().attn_metadata
-        md = raw.get(self.prefix) if isinstance(raw, dict) else None
-        if md is not None and self._mono_gdn_capturable(md, mixed_qkvz):
-            key = ("graph", md.spec_sequence_masks is not None, mixed_qkvz.shape[0])
-            if key not in _MONO_GDN_LOGGED:
-                _MONO_GDN_LOGGED.add(key)
-                logger.info("rdna_mono_gdn: %s %d rows captured in the FULL graph",
-                            "verify" if key[1] else "decode", key[2])
-            self._forward_core_mono(mixed_qkvz, ba, y, graph=True)
-            return
-        capture.add_eager(functools.partial(self._forward_core_mono, mixed_qkvz, ba, y))
-        return
-    self._forward_core_mono(mixed_qkvz, ba, y)
-
-
-direct_register_custom_op(
-    op_name="qwen_gdn_attention_core_mono_g",
-    op_func=qwen_gdn_attention_core_mono_g,
-    mutates_args=["mixed_qkvz", "y"],
 )
 
 

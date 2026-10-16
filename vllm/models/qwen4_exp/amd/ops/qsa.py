@@ -21,8 +21,9 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 # kernel stays on Triton (prefill-only, large M).
 from . import qsa_rdna2
 
-# MonoKernel E3: set by QSAIndexer when additional_config rdna_mono_qsa is on
-MONO_QSA = False
+# Qwen4Exp RDNA2 MonoKernel QSA part (--monokernel): the module
+# vllm/models/qwen4_exp/amd/mono/rdna2/qsa.py once installed, else None.
+MONO_QSA = None
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
@@ -77,7 +78,7 @@ def _qsa_mqa_paged_kernel(
     )
     if tl.program_id(1) == 0:
         tl.store(visible_blocks_ptr + row, visible)
-    if EARLY_EXIT:
+    if EARLY_EXIT:  # noqa: SIM102  (constexpr gate, Triton)
         # E3: the decode top-k reads columns [0, visible) only, so tiles past
         # the live context neither score nor store (valid inside CUDA graphs,
         # where the host column bound is the capture-time worst case)
@@ -276,7 +277,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
         # E3: all-padding tiles (the selection is a valid prefix + -1s)
         # contribute nothing; skip their K/V loads and dots
-        if NOT_SKIP:
+        if NOT_SKIP:  # noqa: SIM108  (constexpr gate, Triton)
             live = True  # compile-time: today's kernel unchanged
         else:
             live = tl.max(logical_token, axis=0) >= 0
@@ -894,41 +895,6 @@ def qsa_select_paged_tokens(
     return out
 
 
-_QSA_DEC_COUNTERS: dict[int, torch.Tensor] = {}
-_QSA_DEC_MIN_ROWS = 3  # HIP (plain-load merge) wins from 3 rows at long context
-
-
-def _qsa_decode_hip_ok(q, k_cache, v_cache, group_size) -> bool:
-    return (
-        _QSA_DEC_MIN_ROWS <= q.shape[0] <= 64
-        and q.dtype == torch.float16
-        and q.shape[2] == 256
-        and group_size <= 8
-        and k_cache.stride(3) == 1
-        and v_cache.stride(3) == 1
-        and all(st % 8 == 0 for st in (*k_cache.stride()[:3], *v_cache.stride()[:3]))
-        and q.stride(0) % 8 == 0
-        and q.stride(1) % 8 == 0
-        and hasattr(torch.ops, "_rocm_C")
-        and hasattr(torch.ops._rocm_C, "qsa_decode_rdna2")
-    )
-
-
-def _qsa_decode_hip(q, k_cache, v_cache, indices, block_table, token_to_req, out):
-    """MonoKernel E3: one-launch HIP sparse decode attention (split + merge)."""
-    dev = q.device.index if q.device.index is not None else torch.cuda.current_device()
-    counters = _QSA_DEC_COUNTERS.get(dev)
-    if counters is None:  # QSA runs as an eager break: never allocated under capture
-        counters = torch.zeros(64 * 64, dtype=torch.int32, device=q.device)
-        _QSA_DEC_COUNTERS[dev] = counters
-    rows, heads, kvh = q.shape[0], q.shape[1], k_cache.shape[2]
-    splits = int(torch.ops._rocm_C.qsa_decode_rdna2_splits(rows, kvh, indices.shape[1]))
-    scratch = torch.empty(splits * rows * heads * 257, dtype=torch.float32, device=q.device)
-    torch.ops._rocm_C.qsa_decode_rdna2(
-        q, k_cache, v_cache, indices, block_table, token_to_req, out, scratch, counters, splits
-    )
-
-
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -977,8 +943,9 @@ def qsa_sparse_paged_attention(
         return out
 
     group_size = q.shape[1] // k_cache.shape[2]
-    if MONO_QSA and _qsa_decode_hip_ok(q, k_cache, v_cache, group_size):
-        _qsa_decode_hip(q, k_cache, v_cache, logical_indices, block_table, token_to_req, out)
+    if MONO_QSA and MONO_QSA.sparse_decode(
+        q, k_cache, v_cache, group_size, logical_indices, block_table, token_to_req, out
+    ):
         return out
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
@@ -1127,99 +1094,6 @@ def qsa_store_cache_rows(
         BLOCK_D=triton.next_power_of_2(cache.shape[3]),
         num_warps=4,
     )
-
-
-@triton.jit
-def _store_qsa_rows3_kernel(
-    c_cache_ptr, c_slots_ptr, c_rows_ptr,  # compressed keys (compressed slots)
-    r_cache_ptr, r_slots_ptr, r_rows_ptr,  # raw keys (raw slots)
-    p_cache_ptr, p_rows_ptr,               # rope positions (raw slots)
-    c_sb, c_st, c_sd, c_rr, c_rd, c_nb,
-    r_sb, r_st, r_sd, r_rr, r_rd, r_nb,
-    p_sb, p_st, p_sd, p_rr, p_rd, p_nb,
-    num_rows,
-    C_PAGE: tl.constexpr, C_WIDTH: tl.constexpr, C_BLOCK: tl.constexpr,
-    R_PAGE: tl.constexpr, R_WIDTH: tl.constexpr, R_BLOCK: tl.constexpr,
-    P_PAGE: tl.constexpr, P_WIDTH: tl.constexpr, P_BLOCK: tl.constexpr,
-) -> None:
-    """MonoKernel E3: the indexer's three per-token cache stores in one launch
-    (same masking as _store_qsa_rows_kernel, applied to each store)."""
-    row = tl.program_id(0)
-    # compressed key row
-    dims = tl.arange(0, C_BLOCK)
-    slot = tl.load(c_slots_ptr + row)
-    ok = (row < num_rows) & (slot >= 0) & (slot < c_nb * C_PAGE)
-    blk = tl.maximum(slot, 0) // C_PAGE
-    tok = tl.maximum(slot, 0) % C_PAGE
-    v = tl.load(c_rows_ptr + row * c_rr + dims * c_rd, mask=ok & (dims < C_WIDTH), other=0)
-    tl.store(c_cache_ptr + blk * c_sb + tok * c_st + dims * c_sd, v, mask=ok & (dims < C_WIDTH))
-    # raw key row and its rope positions share the raw slot
-    slot = tl.load(r_slots_ptr + row)
-    dims = tl.arange(0, R_BLOCK)
-    ok = (row < num_rows) & (slot >= 0) & (slot < r_nb * R_PAGE)
-    blk = tl.maximum(slot, 0) // R_PAGE
-    tok = tl.maximum(slot, 0) % R_PAGE
-    v = tl.load(r_rows_ptr + row * r_rr + dims * r_rd, mask=ok & (dims < R_WIDTH), other=0)
-    tl.store(r_cache_ptr + blk * r_sb + tok * r_st + dims * r_sd, v, mask=ok & (dims < R_WIDTH))
-    pdims = tl.arange(0, P_BLOCK)
-    pok = (row < num_rows) & (slot >= 0) & (slot < p_nb * P_PAGE)
-    pblk = tl.maximum(slot, 0) // P_PAGE
-    ptok = tl.maximum(slot, 0) % P_PAGE
-    pv = tl.load(p_rows_ptr + row * p_rr + pdims * p_rd, mask=pok & (pdims < P_WIDTH), other=0)
-    tl.store(p_cache_ptr + pblk * p_sb + ptok * p_st + pdims * p_sd, pv,
-             mask=pok & (pdims < P_WIDTH))
-
-
-def qsa_store_cache_rows3(
-    c_cache: torch.Tensor,
-    c_slots: torch.Tensor,
-    c_rows: torch.Tensor,
-    r_cache: torch.Tensor,
-    r_slots: torch.Tensor,
-    r_rows: torch.Tensor,
-    p_cache: torch.Tensor,
-    p_rows: torch.Tensor,
-) -> bool:
-    """One launch for the three indexer stores; False when the shapes are not
-    the one-head, same-row-count case (the caller then stores one by one)."""
-    if qsa_rdna2.qsa_use_rdna2() or not HAS_TRITON:
-        return False
-    rows = []
-    for cache, slots, r in ((c_cache, c_slots, c_rows), (r_cache, r_slots, r_rows),
-                            (p_cache, r_slots, p_rows)):
-        if cache.ndim != 4 or cache.shape[2] != 1 or not all(cache.shape):
-            return False
-        if r.ndim == 3:
-            if r.shape[1] != 1:
-                return False
-            r = r[:, 0]
-        if r.shape != (slots.numel(), cache.shape[3]):
-            return False
-        rows.append(r)
-    n = rows[0].shape[0]
-    if rows[1].shape[0] != n or rows[2].shape[0] != n:
-        return False
-    if n == 0:
-        return True
-    cr, rr, pr = rows
-    _store_qsa_rows3_kernel[(n,)](
-        c_cache, c_slots, cr, r_cache, r_slots, rr, p_cache, pr,
-        c_cache.stride(0), c_cache.stride(1), c_cache.stride(3), cr.stride(0), cr.stride(1),
-        c_cache.shape[0],
-        r_cache.stride(0), r_cache.stride(1), r_cache.stride(3), rr.stride(0), rr.stride(1),
-        r_cache.shape[0],
-        p_cache.stride(0), p_cache.stride(1), p_cache.stride(3), pr.stride(0), pr.stride(1),
-        p_cache.shape[0],
-        n,
-        C_PAGE=c_cache.shape[1], C_WIDTH=c_cache.shape[3],
-        C_BLOCK=triton.next_power_of_2(c_cache.shape[3]),
-        R_PAGE=r_cache.shape[1], R_WIDTH=r_cache.shape[3],
-        R_BLOCK=triton.next_power_of_2(r_cache.shape[3]),
-        P_PAGE=p_cache.shape[1], P_WIDTH=p_cache.shape[3],
-        P_BLOCK=triton.next_power_of_2(p_cache.shape[3]),
-        num_warps=4,
-    )
-    return True
 
 
 def qsa_compress_groups_with_ratio(

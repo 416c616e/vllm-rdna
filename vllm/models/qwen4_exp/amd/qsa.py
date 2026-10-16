@@ -173,7 +173,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         from .ops import qsa as _qsa_ops
 
         if _qsa_ops.MONO_QSA:
-            # E3: the sparse kernel writes every live row; only padding needs zeros
+            # MonoKernel QSA: the sparse kernel writes every live row; only
+            # padding needs zeros
             if output.shape[0] > num_tokens:
                 output[num_tokens:].zero_()
         else:

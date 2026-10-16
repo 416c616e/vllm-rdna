@@ -1,3 +1,11 @@
+> **Current state (2026-10-16):** the MonoKernel ships behind `--monokernel`;
+> usage, parts and knobs are in
+> [`vllm/models/qwen4_exp/amd/mono/rdna2/README.md`](../../../vllm/models/qwen4_exp/amd/mono/rdna2/README.md),
+> tools in [`tools/rdna/mono/`](../../../tools/rdna/mono/README.md). The pages
+> in this directory are the history (plan, P0, 2a, Stage E); their
+> `rdna_mono_*` keys, `mono_ffn.py` and `tools/monokernel-2a/` paths are the
+> pre-move names.
+
 # MonoKernel plan for gfx1030 (Flash-Next, FFN-only)
 
 Status: **plan**. Nothing here is wired into the vLLM build. There is no
