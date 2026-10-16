@@ -39,45 +39,52 @@
 namespace gdn_fused {
 
 constexpr int kK = 128, kV = 128, kBV = 32, kThreads = 256, kConvW = 4;
-constexpr int kMaxT = 8;      // tokens per sequence (MTP verify)
+constexpr int kMaxT = 8;  // tokens per sequence (MTP verify)
 constexpr int kMaxSL = kConvW - 1 + kMaxT - 1;  // conv state window
-constexpr int kCapRows = 64;  // rows (tokens) per call
+constexpr int kCapRows = 64;                    // rows (tokens) per call
 
-__device__ __forceinline__ float rh(float v) { return __half2float(__float2half(v)); }
-__device__ __forceinline__ float silu_f(float v) { return v / (1.f + __expf(-v)); }
+__device__ __forceinline__ float rh(float v) {
+  return __half2float(__float2half(v));
+}
+__device__ __forceinline__ float silu_f(float v) {
+  return v / (1.f + __expf(-v));
+}
 
 struct Args {
   const half* qkvz;  // [M, ldq]: q (H*K) | k (H*K) | v (HV*V) | z (HV*V)
   long ldq;
-  const half* ba;    // [M, ldba]: b (HV) | a (HV)
+  const half* ba;  // [M, ldba]: b (HV) | a (HV)
   long ldba;
-  const half* cw;    // conv weight [CD, 4]
-  const half* cb;    // conv bias [CD] or null
-  half* cs;          // conv state (slot, channel, tok) via strides
+  const half* cw;  // conv weight [CD, 4]
+  const half* cb;  // conv bias [CD] or null
+  half* cs;        // conv state (slot, channel, tok) via strides
   long cs_slot, cs_dim, cs_tok;
   const float* alog;  // [HV]
   const float* dtb;   // [HV]
   float* ssm;         // [slots, HV, V, K] fp32
   long ss_slot;
-  const int* sidx;    // non-spec [N]; spec [N, T]
+  const int* sidx;  // non-spec [N]; spec [N, T]
   long sidx_seq;
   const int* nacc;    // spec or null
   const int* qsl;     // spec or null
   const half* normw;  // [V]
   float scale, eps;
   int sig, H, HV, CD, slots, tmax;
-  unsigned long long* ssq;  // [kCapRows, HV] fixed-point sums (zero between calls)
-  int* cnt;                 // [kCapRows, HV] norm arrivals (zero between calls)
-  int* cntqk;               // [kCapRows, H] q|k state arrivals (zero between calls)
-  half* obuf;               // [M, HV, V] fp16
-  half* y;                  // [M, HV * V]
+  unsigned long long*
+      ssq;     // [kCapRows, HV] fixed-point sums (zero between calls)
+  int* cnt;    // [kCapRows, HV] norm arrivals (zero between calls)
+  int* cntqk;  // [kCapRows, H] q|k state arrivals (zero between calls)
+  half* obuf;  // [M, HV, V] fp16
+  half* y;     // [M, HV * V]
 };
 
 // conv1d update of one channel: T outputs (fp16-rounded, like today's conv
 // output tensor) to out[t * ostride], the rolled state window to nst
-__device__ __forceinline__ void conv_channel(const Args& a, int ch, const half* base, long off,
-                                             int state_len, int T, long bos, bool spec,
-                                             float* out, int ostride, half* nst) {
+__device__ __forceinline__ void conv_channel(const Args& a, int ch,
+                                             const half* base, long off,
+                                             int state_len, int T, long bos,
+                                             bool spec, float* out, int ostride,
+                                             half* nst) {
   float c0 = __half2float(base[off * a.cs_tok]);
   float c1 = __half2float(base[(off + 1) * a.cs_tok]);
   float c2 = __half2float(base[(off + 2) * a.cs_tok]);
@@ -85,8 +92,9 @@ __device__ __forceinline__ void conv_channel(const Args& a, int ch, const half* 
 #pragma unroll
   for (int t = 0; t < kMaxSL; t++) {
     if (t < state_len)
-      nst[t] = (t + T < state_len) ? base[(off + t + shift) * a.cs_tok]
-                                   : a.qkvz[(bos + t - (state_len - T)) * a.ldq + ch];
+      nst[t] = (t + T < state_len)
+                   ? base[(off + t + shift) * a.cs_tok]
+                   : a.qkvz[(bos + t - (state_len - T)) * a.ldq + ch];
   }
   const half* w = a.cw + (long)ch * kConvW;
   const float w0 = __half2float(w[0]), w1 = __half2float(w[1]);
@@ -98,8 +106,9 @@ __device__ __forceinline__ void conv_channel(const Args& a, int ch, const half* 
       const float x = __half2float(a.qkvz[(bos + t) * a.ldq + ch]);
       // spec: the Triton update (fp16 products into fp32); non-spec: the HIP
       // causal_conv1d_update_rdna2 (fp32 multiply-adds)
-      const float acc = spec ? b + rh(w0 * c0) + rh(w1 * c1) + rh(w2 * c2) + rh(w3 * x)
-                             : fmaf(w3, x, fmaf(w2, c2, fmaf(w1, c1, fmaf(w0, c0, b))));
+      const float acc =
+          spec ? b + rh(w0 * c0) + rh(w1 * c1) + rh(w2 * c2) + rh(w3 * x)
+               : fmaf(w3, x, fmaf(w2, c2, fmaf(w1, c1, fmaf(w0, c0, b))));
       out[t * ostride] = rh(silu_f(acc));
       c0 = c1;
       c1 = c2;
@@ -108,8 +117,8 @@ __device__ __forceinline__ void conv_channel(const Args& a, int ch, const half* 
   }
 }
 
-__device__ __forceinline__ void store_window(const Args& a, half* base, int state_len,
-                                             const half* nst) {
+__device__ __forceinline__ void store_window(const Args& a, half* base,
+                                             int state_len, const half* nst) {
 #pragma unroll
   for (int t = 0; t < kMaxSL; t++)
     if (t < state_len) base[t * a.cs_tok] = nst[t];
@@ -118,9 +127,10 @@ __device__ __forceinline__ void store_window(const Args& a, half* base, int stat
 // lane ks owns k = 32*jj + 4*ks + e (KMAP 1: 8 lanes cover 128 B of a row per
 // load, best up to ~16 rows) or k = 16*ks + j (KMAP 0: 64 B per lane, best for
 // wide non-spec batches, measured cold over 64 layers)
-#define KIDX(j) (KMAP ? ((((j) >> 2) << 5) + (ks << 2) + ((j) & 3)) : ((ks << 4) + (j)))
+#define KIDX(j) \
+  (KMAP ? ((((j) >> 2) << 5) + (ks << 2) + ((j) & 3)) : ((ks << 4) + (j)))
 #ifndef GDN_FUSED_NT
-#define GDN_FUSED_NT 1
+  #define GDN_FUSED_NT 1
 #endif
 __device__ __forceinline__ float ld_state(const float* p) {
 #if GDN_FUSED_NT
@@ -180,19 +190,21 @@ __global__ void __launch_bounds__(kThreads) gdn_fused_k(const Args a) {
   half* cbase = a.cs + cslot * a.cs_slot;
   const int ch = tid < kK ? h * kK + tid : a.H * kK + h * kK + (tid - kK);
   half nst[kMaxSL];
-  conv_channel(a, ch, cbase + (long)ch * a.cs_dim, off, state_len, T, bos, spec, s_qk + tid,
-               2 * kK, nst);
+  conv_channel(a, ch, cbase + (long)ch * a.cs_dim, off, state_len, T, bos, spec,
+               s_qk + tid, 2 * kK, nst);
   if (tid < kBV) {
     const int chv = 2 * a.H * kK + hv * kV + tile * kBV + tid;
     half nv[kMaxSL];
-    conv_channel(a, chv, cbase + (long)chv * a.cs_dim, off, state_len, T, bos, spec,
-                 s_v + tid, kBV, nv);
-    store_window(a, cbase + (long)chv * a.cs_dim, state_len, nv);  // own channel
+    conv_channel(a, chv, cbase + (long)chv * a.cs_dim, off, state_len, T, bos,
+                 spec, s_v + tid, kBV, nv);
+    store_window(a, cbase + (long)chv * a.cs_dim, state_len,
+                 nv);  // own channel
   }
   __syncthreads();
   if (tid == 0) {
     __threadfence();
-    s_own = atomicAdd(&a.cntqk[seq * a.H + h], 1) == (a.HV / a.H) * (kV / kBV) - 1;
+    s_own =
+        atomicAdd(&a.cntqk[seq * a.H + h], 1) == (a.HV / a.H) * (kV / kBV) - 1;
   }
   __syncthreads();
   if (s_own) {  // every tile of this key head has read the q|k window
@@ -224,7 +236,8 @@ __global__ void __launch_bounds__(kThreads) gdn_fused_k(const Args a) {
     }
     nq = ksum8(nq);
     nk = ksum8(nk);
-    const float qs = spec ? rsqrtf(nq + 1e-6f) * a.scale : a.scale / sqrtf(nq + 1e-6f);
+    const float qs =
+        spec ? rsqrtf(nq + 1e-6f) * a.scale : a.scale / sqrtf(nq + 1e-6f);
     const float kss = spec ? rsqrtf(nk + 1e-6f) : 1.f / sqrtf(nk + 1e-6f);
 #pragma unroll
     for (int j = 0; j < 16; j++) {
@@ -272,7 +285,8 @@ __global__ void __launch_bounds__(kThreads) gdn_fused_k(const Args a) {
       float tot = 0.f;
 #pragma unroll
       for (int w8 = 0; w8 < kThreads / 32; w8++) tot += s_red[w8];
-      atomicAdd(&a.ssq[tok * a.HV + hv], (unsigned long long)__float2ll_rn(tot * 4294967296.f));
+      atomicAdd(&a.ssq[tok * a.HV + hv],
+                (unsigned long long)__float2ll_rn(tot * 4294967296.f));
     }
     __syncthreads();
   }
@@ -293,13 +307,15 @@ __global__ void __launch_bounds__(kThreads) gdn_fused_k(const Args a) {
     const float tot = __ll2float_rn(fx) * (1.f / 4294967296.f);
     const float rstd = rsqrtf(tot / kV + a.eps);
     for (int i = tid; i < kV; i += kThreads) {
-      const unsigned short ob = *reinterpret_cast<const volatile unsigned short*>(
-          &a.obuf[(tok * a.HV + hv) * kV + i]);
+      const unsigned short ob =
+          *reinterpret_cast<const volatile unsigned short*>(
+              &a.obuf[(tok * a.HV + hv) * kV + i]);
       const float o = __half2float(__ushort_as_half(ob));
       const float zv = __half2float(a.qkvz[tok * a.ldq + a.CD + hv * kV + i]);
       const float sg = 1.f / (1.f + expf(-zv));
       const float gate = a.sig ? sg : zv * sg;
-      a.y[tok * VD + hv * kV + i] = __float2half(o * rstd * __half2float(a.normw[i]) * gate);
+      a.y[tok * VD + hv * kV + i] =
+          __float2half(o * rstd * __half2float(a.normw[i]) * gate);
     }
     __syncthreads();
     if (tid == 0) *ps = 0ull;
@@ -314,13 +330,14 @@ __global__ void __launch_bounds__(kThreads) gdn_fused_k(const Args a) {
 // int32, nacc [N], qsl [N + 1]. scratch: uint8 >= mono_gdn_rdna2_scratch_bytes,
 // zero-initialized once (the kernel leaves its counters zero).
 void mono_gdn_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
-                     const torch::Tensor& conv_w, const torch::Tensor& conv_b,
-                     torch::Tensor& conv_state, torch::Tensor& ssm_state,
-                     const torch::Tensor& A_log, const torch::Tensor& dt_bias,
-                     const torch::Tensor& norm_w, const torch::Tensor& sidx,
-                     const torch::Tensor& nacc, const torch::Tensor& qsl,
-                     torch::Tensor& y, torch::Tensor& scratch, int64_t num_k_heads,
-                     double scale, double eps, int64_t gate_sigmoid) {
+                    const torch::Tensor& conv_w, const torch::Tensor& conv_b,
+                    torch::Tensor& conv_state, torch::Tensor& ssm_state,
+                    const torch::Tensor& A_log, const torch::Tensor& dt_bias,
+                    const torch::Tensor& norm_w, const torch::Tensor& sidx,
+                    const torch::Tensor& nacc, const torch::Tensor& qsl,
+                    torch::Tensor& y, torch::Tensor& scratch,
+                    int64_t num_k_heads, double scale, double eps,
+                    int64_t gate_sigmoid) {
   using namespace gdn_fused;
   const int M = qkvz.size(0);
   const int HV = ssm_state.size(1);
@@ -329,39 +346,54 @@ void mono_gdn_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
   const bool spec = nacc.numel() > 0;
   const int N = spec ? (int)nacc.size(0) : M;
   TORCH_CHECK(qkvz.scalar_type() == at::kHalf && qkvz.stride(1) == 1 &&
-                  qkvz.size(1) >= CD + HV * kV, "mono_gdn_rdna2: qkvz fp16 [M, >= CD + HV*V]");
-  TORCH_CHECK(ba.scalar_type() == at::kHalf && ba.stride(1) == 1 && ba.size(1) >= 2 * HV &&
-                  ba.size(0) >= M, "mono_gdn_rdna2: ba fp16 [M, 2*HV]");
-  TORCH_CHECK(conv_w.numel() == (int64_t)CD * kConvW && conv_w.is_contiguous() &&
-                  conv_w.scalar_type() == at::kHalf, "mono_gdn_rdna2: conv weight fp16 [CD, 4]");
-  TORCH_CHECK(conv_b.numel() == 0 || (conv_b.numel() == CD && conv_b.scalar_type() == at::kHalf),
+                  qkvz.size(1) >= CD + HV * kV,
+              "mono_gdn_rdna2: qkvz fp16 [M, >= CD + HV*V]");
+  TORCH_CHECK(ba.scalar_type() == at::kHalf && ba.stride(1) == 1 &&
+                  ba.size(1) >= 2 * HV && ba.size(0) >= M,
+              "mono_gdn_rdna2: ba fp16 [M, 2*HV]");
+  TORCH_CHECK(conv_w.numel() == (int64_t)CD * kConvW &&
+                  conv_w.is_contiguous() && conv_w.scalar_type() == at::kHalf,
+              "mono_gdn_rdna2: conv weight fp16 [CD, 4]");
+  TORCH_CHECK(conv_b.numel() == 0 ||
+                  (conv_b.numel() == CD && conv_b.scalar_type() == at::kHalf),
               "mono_gdn_rdna2: conv bias fp16 [CD]");
   TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(1) == CD &&
-                  conv_state.scalar_type() == at::kHalf, "mono_gdn_rdna2: conv state (slots, CD, len)");
-  TORCH_CHECK(ssm_state.dim() == 4 && ssm_state.size(2) == kV && ssm_state.size(3) == kK &&
-                  ssm_state.scalar_type() == at::kFloat && ssm_state.stride(3) == 1 &&
-                  ssm_state.stride(2) == kK && ssm_state.stride(1) == (int64_t)kV * kK,
+                  conv_state.scalar_type() == at::kHalf,
+              "mono_gdn_rdna2: conv state (slots, CD, len)");
+  TORCH_CHECK(ssm_state.dim() == 4 && ssm_state.size(2) == kV &&
+                  ssm_state.size(3) == kK &&
+                  ssm_state.scalar_type() == at::kFloat &&
+                  ssm_state.stride(3) == 1 && ssm_state.stride(2) == kK &&
+                  ssm_state.stride(1) == (int64_t)kV * kK,
               "mono_gdn_rdna2: ssm state [slots, HV, 128, 128] fp32");
-  TORCH_CHECK(H > 0 && HV % H == 0 && A_log.numel() == HV && dt_bias.numel() == HV &&
-                  A_log.scalar_type() == at::kFloat && dt_bias.scalar_type() == at::kFloat,
+  TORCH_CHECK(H > 0 && HV % H == 0 && A_log.numel() == HV &&
+                  dt_bias.numel() == HV && A_log.scalar_type() == at::kFloat &&
+                  dt_bias.scalar_type() == at::kFloat,
               "mono_gdn_rdna2: A_log / dt_bias fp32 [HV]");
   TORCH_CHECK(norm_w.numel() == kV && norm_w.scalar_type() == at::kHalf,
               "mono_gdn_rdna2: norm weight fp16 [V]");
   TORCH_CHECK(sidx.scalar_type() == at::kInt && sidx.size(0) >= N &&
-                  (sidx.dim() == 1 || sidx.stride(1) == 1), "mono_gdn_rdna2: sidx int32");
+                  (sidx.dim() == 1 || sidx.stride(1) == 1),
+              "mono_gdn_rdna2: sidx int32");
   TORCH_CHECK(y.scalar_type() == at::kHalf && y.is_contiguous() &&
-                  y.numel() >= (int64_t)M * HV * kV, "mono_gdn_rdna2: y fp16 [M, HV*V]");
+                  y.numel() >= (int64_t)M * HV * kV,
+              "mono_gdn_rdna2: y fp16 [M, HV*V]");
   const int tmax = spec ? (int)sidx.size(1) : 1;
   TORCH_CHECK(tmax <= kMaxT, "mono_gdn_rdna2: at most 8 tokens per sequence");
-  TORCH_CHECK(conv_state.size(2) >= (kConvW - 1) + (tmax - 1), "mono_gdn_rdna2: conv state length");
+  TORCH_CHECK(conv_state.size(2) >= (kConvW - 1) + (tmax - 1),
+              "mono_gdn_rdna2: conv state length");
   if (spec)
     TORCH_CHECK(qsl.numel() >= N + 1 && qsl.scalar_type() == at::kInt &&
-                    nacc.scalar_type() == at::kInt, "mono_gdn_rdna2: qsl [N+1], nacc [N] int32");
-  TORCH_CHECK(M <= kCapRows && N <= kCapRows, "mono_gdn_rdna2: at most 64 rows");
-  // scratch: [ssq | cnt | cntqk] at fixed offsets (zero between calls) then obuf
+                    nacc.scalar_type() == at::kInt,
+                "mono_gdn_rdna2: qsl [N+1], nacc [N] int32");
+  TORCH_CHECK(M <= kCapRows && N <= kCapRows,
+              "mono_gdn_rdna2: at most 64 rows");
+  // scratch: [ssq | cnt | cntqk] at fixed offsets (zero between calls) then
+  // obuf
   const int64_t zb = (int64_t)kCapRows * (HV * 12 + H * 4);
   const int64_t need = zb + (int64_t)M * HV * kV * 2;
-  TORCH_CHECK(scratch.numel() * scratch.element_size() >= need, "mono_gdn_rdna2: scratch too small");
+  TORCH_CHECK(scratch.numel() * scratch.element_size() >= need,
+              "mono_gdn_rdna2: scratch too small");
   if (M == 0 || N == 0) return;
   const at::cuda::OptionalCUDAGuard guard(qkvz.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -373,7 +405,8 @@ void mono_gdn_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
   a.ba = reinterpret_cast<const half*>(ba.data_ptr());
   a.ldba = ba.stride(0);
   a.cw = reinterpret_cast<const half*>(conv_w.data_ptr());
-  a.cb = conv_b.numel() > 0 ? reinterpret_cast<const half*>(conv_b.data_ptr()) : nullptr;
+  a.cb = conv_b.numel() > 0 ? reinterpret_cast<const half*>(conv_b.data_ptr())
+                            : nullptr;
   a.cs = reinterpret_cast<half*>(conv_state.data_ptr());
   a.cs_slot = conv_state.stride(0);
   a.cs_dim = conv_state.stride(1);
@@ -410,5 +443,6 @@ void mono_gdn_rdna2(const torch::Tensor& qkvz, const torch::Tensor& ba,
 }
 
 int64_t mono_gdn_rdna2_scratch_bytes(int64_t M, int64_t HV, int64_t H) {
-  return (int64_t)gdn_fused::kCapRows * (HV * 12 + H * 4) + M * HV * gdn_fused::kV * 2;
+  return (int64_t)gdn_fused::kCapRows * (HV * 12 + H * 4) +
+         M * HV * gdn_fused::kV * 2;
 }

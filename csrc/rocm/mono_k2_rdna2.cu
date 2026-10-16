@@ -68,12 +68,12 @@ constexpr int kHC = 4;
 constexpr int kRowChunk = 8;
 // E1 GDN decode (Qwen4Exp linear-attention layers, per TP rank).
 constexpr int kGdnH = 4, kGdnHV = 12, kGdnK = 128, kGdnV = 128;
-constexpr int kGdnQK = 2 * kGdnH * kGdnK;           // 1024 conv channels of q|k
-constexpr int kGdnCD = kGdnQK + kGdnHV * kGdnV;     // 2560 conv channels (q|k|v)
-constexpr int kGdnNQ = kGdnCD + kGdnHV * kGdnV;     // 4096 in_proj_qkvz rows
-constexpr int kGdnNB = 2 * kGdnHV;                  // 24 in_proj_ba rows (b|a)
-constexpr int kGdnNI = kGdnNQ + kGdnNB;             // 4120 projected columns
-constexpr int kGdnVD = kGdnHV * kGdnV;              // 1536 out_proj inputs
+constexpr int kGdnQK = 2 * kGdnH * kGdnK;        // 1024 conv channels of q|k
+constexpr int kGdnCD = kGdnQK + kGdnHV * kGdnV;  // 2560 conv channels (q|k|v)
+constexpr int kGdnNQ = kGdnCD + kGdnHV * kGdnV;  // 4096 in_proj_qkvz rows
+constexpr int kGdnNB = 2 * kGdnHV;               // 24 in_proj_ba rows (b|a)
+constexpr int kGdnNI = kGdnNQ + kGdnNB;          // 4120 projected columns
+constexpr int kGdnVD = kGdnHV * kGdnV;           // 1536 out_proj inputs
 
 struct Ctrl {
   unsigned count;  // barrier arrivals
@@ -83,16 +83,17 @@ struct Ctrl {
   int err_wg;
   int pad[3];
   unsigned long long ts[8];  // WG0 wall clock at entry and after each phase
-  unsigned long long wg_done[10][256];  // per-WG end of phase work (debug); 7-9: P5 sub-steps
-  int topk_id[kMaxPairs];              // WG0's routing of the last launch
-  float topw[kMaxPairs];               // grid top-k weights (M > GTOPK_MIN)
-  int gwork[4];                        // dynamic row counters (GDN GEMVs), reset in P1
+  unsigned long long
+      wg_done[10][256];  // per-WG end of phase work (debug); 7-9: P5 sub-steps
+  int topk_id[kMaxPairs];  // WG0's routing of the last launch
+  float topw[kMaxPairs];   // grid top-k weights (M > GTOPK_MIN)
+  int gwork[4];            // dynamic row counters (GDN GEMVs), reset in P1
 };
 
-// Cross-WG fp32 reductions use 64-bit fixed point (2^-32 resolution, |v| < 2^31):
-// gfx1030 has no global fp32 atomic add (atomicAdd(float*) is a CAS loop that
-// retries under contention), but global_atomic_add_x2 is native. Integer sums
-// are also order-independent, so the reductions are deterministic.
+// Cross-WG fp32 reductions use 64-bit fixed point (2^-32 resolution, |v| <
+// 2^31): gfx1030 has no global fp32 atomic add (atomicAdd(float*) is a CAS loop
+// that retries under contention), but global_atomic_add_x2 is native. Integer
+// sums are also order-independent, so the reductions are deterministic.
 struct Fx {
   long long v;
   __device__ __forceinline__ Fx& operator=(float f) {
@@ -106,17 +107,17 @@ struct Fx {
 using ::atomicAdd;  // keep the HIP overloads visible next to the Fx one
 __device__ __forceinline__ void atomicAdd(Fx* p, float f) {
   ::atomicAdd(reinterpret_cast<unsigned long long*>(&p->v),
-            (unsigned long long)__float2ll_rn(f * 4294967296.f));
+              (unsigned long long)__float2ll_rn(f * 4294967296.f));
 }
 
 struct Params {
   // activations
-  const half* res;    // [M, HC*H]
-  const half* blk;    // [M, H]   attention output (after its all-reduce)
-  const half* inj;    // [M, HC]  pending injection logits
-  half* res_out;      // [M, HC*H]
-  half* inj_out;      // [M, HC]
-  half* out;          // [M, H]   rank-local FFN partial (pre all-reduce)
+  const half* res;  // [M, HC*H]
+  const half* blk;  // [M, H]   attention output (after its all-reduce)
+  const half* inj;  // [M, HC]  pending injection logits
+  half* res_out;    // [M, HC*H]
+  half* inj_out;    // [M, HC]
+  half* out;        // [M, H]   rank-local FFN partial (pre all-reduce)
   // weights
   const half* norm_w;  // [HC*H]
   const half* wd;      // [ND, HC*H]
@@ -133,15 +134,15 @@ struct Params {
   const uint32_t* z2;
   // workspace
   Ctrl* ctrl;
-  Fx* dai;       // [M, ND]
-  Fx* acc;       // [M, H]
-  half* xn;         // [M, HC*H]
-  half* bin;        // [M, H]
-  Fx* logits;    // [M, E]
-  Fx* se_g;      // [M, 2*Ise] shared-expert gate|up pre-activation
-  Fx* se_gate;   // [M] expert-gate logit
-  half* act;        // [M*topk, I]
-  Fx* gu;           // [M*topk, 2I] routed gate|up sums (P5b tiles; cleared by P5c)
+  Fx* dai;      // [M, ND]
+  Fx* acc;      // [M, H]
+  half* xn;     // [M, HC*H]
+  half* bin;    // [M, H]
+  Fx* logits;   // [M, E]
+  Fx* se_g;     // [M, 2*Ise] shared-expert gate|up pre-activation
+  Fx* se_gate;  // [M] expert-gate logit
+  half* act;    // [M*topk, I]
+  Fx* gu;       // [M*topk, 2I] routed gate|up sums (P5b tiles; cleared by P5c)
   // shapes
   int M, H, R, ND, E, Ise, I, group, expert_base, zero_offset;
   float eps;
@@ -155,7 +156,7 @@ struct Params {
   const half* g_convb;  // [2560] or null
   half* g_convs;        // conv state (slot, channel, 3) via strides, in place
   long g_cs_slot, g_cs_dim, g_cs_t;
-  float* g_ssm;         // [slots, 12, 128 (V), 128 (K)] fp32, in place
+  float* g_ssm;  // [slots, 12, 128 (V), 128 (K)] fp32, in place
   long g_ss_slot;
   int g_slots;
   const float* g_alog;  // [12]
@@ -164,10 +165,10 @@ struct Params {
   const half* g_wo;     // out_proj [H, 1536]
   const int* g_sidx;    // state slot per row [M]
   float g_scale, g_eps;
-  int g_sig;            // gate: 0 silu(z), 1 sigmoid(z)
-  Fx* g_q;              // [M, 4120] projected q|k|v|z|b|a sums
-  half* g_y;            // [M, 1536] gated-norm output
-  half* g_st;           // [M, 1024, 3] new q|k conv state (deferred write)
+  int g_sig;   // gate: 0 silu(z), 1 sigmoid(z)
+  Fx* g_q;     // [M, 4120] projected q|k|v|z|b|a sums
+  half* g_y;   // [M, 1536] gated-norm output
+  half* g_st;  // [M, 1024, 3] new q|k conv state (deferred write)
   unsigned long long timeout_ticks;
   // Stage D: the FFN all-reduce (rdna_ar one-shot protocol) at the end of P7
   int ar_on;
@@ -200,8 +201,12 @@ constexpr int kTuneSleep = 5, kTuneFlags = 6, kFlagNoDebug = 1;
 constexpr int kStatRows = kMaxM + 1;
 constexpr int kStatWords = (kStatRows + 1) * kStatCols;
 
-__device__ __forceinline__ float silu_f(float v) { return v / (1.f + __expf(-v)); }
-__device__ __forceinline__ float sigmoid_f(float v) { return 1.f / (1.f + __expf(-v)); }
+__device__ __forceinline__ float silu_f(float v) {
+  return v / (1.f + __expf(-v));
+}
+__device__ __forceinline__ float sigmoid_f(float v) {
+  return 1.f / (1.f + __expf(-v));
+}
 
 template <int N>
 __device__ __forceinline__ void wave_sum(float (&a)[N]) {
@@ -236,7 +241,8 @@ __device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
   __syncthreads();
   if (threadIdx.x < 32) {
     if (threadIdx.x == 0) {
-      const unsigned long long* tune = p.stats ? p.stats + (kMaxM + 1) * kStatCols : nullptr;
+      const unsigned long long* tune =
+          p.stats ? p.stats + (kMaxM + 1) * kStatCols : nullptr;
       const int sleep = tune ? (int)tune[kTuneSleep] : 0;
       const int flags = tune ? (int)tune[kTuneFlags] : 0;
       if (!(flags & kFlagNoDebug) && blockIdx.x < 256)
@@ -260,7 +266,10 @@ __device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
         // after the barrier orders the data.
         while (__hip_atomic_load(&c->gen, __ATOMIC_RELAXED,
                                  __HIP_MEMORY_SCOPE_AGENT) == g) {
-          if (err_set(c)) { ok = 0; break; }
+          if (err_set(c)) {
+            ok = 0;
+            break;
+          }
           if (wall_clock64() - t0 > p.timeout_ticks) {
             int zero = 0;
             if (__hip_atomic_compare_exchange_strong(
@@ -273,14 +282,30 @@ __device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
             break;
           }
           switch (sleep) {
-            case 2: __builtin_amdgcn_s_sleep(2); break;
-            case 4: __builtin_amdgcn_s_sleep(4); break;
-            case 8: __builtin_amdgcn_s_sleep(8); break;
-            case 16: __builtin_amdgcn_s_sleep(16); break;
-            case 32: __builtin_amdgcn_s_sleep(32); break;
-            case 64: __builtin_amdgcn_s_sleep(64); break;
-            case 127: __builtin_amdgcn_s_sleep(127); break;
-            default: __builtin_amdgcn_s_sleep(1); break;
+            case 2:
+              __builtin_amdgcn_s_sleep(2);
+              break;
+            case 4:
+              __builtin_amdgcn_s_sleep(4);
+              break;
+            case 8:
+              __builtin_amdgcn_s_sleep(8);
+              break;
+            case 16:
+              __builtin_amdgcn_s_sleep(16);
+              break;
+            case 32:
+              __builtin_amdgcn_s_sleep(32);
+              break;
+            case 64:
+              __builtin_amdgcn_s_sleep(64);
+              break;
+            case 127:
+              __builtin_amdgcn_s_sleep(127);
+              break;
+            default:
+              __builtin_amdgcn_s_sleep(1);
+              break;
           }
         }
       }
@@ -291,7 +316,8 @@ __device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
   } else {
     uint32_t sink = 0;
     if (p.prefetch) prefetch(threadIdx.x - 32, sink, &s_rel);
-    if (sink == 0x9e3779b9u && p.M < 0) p.ctrl->pad[1] = sink;  // keep the loads
+    if (sink == 0x9e3779b9u && p.M < 0)
+      p.ctrl->pad[1] = sink;  // keep the loads
   }
   __syncthreads();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -300,7 +326,8 @@ __device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
 
 // Touch [base, base + n16 * 16) in 16-byte units, strided over 224 threads.
 __device__ __forceinline__ void touch16(const void* base, int n16, int t,
-                                        uint32_t& sink, const volatile int* rel) {
+                                        uint32_t& sink,
+                                        const volatile int* rel) {
   const uint4* q = reinterpret_cast<const uint4*>(base);
   for (int i = t; i < n16; i += 224) {
     if (*rel) return;  // released: stop, the next phase is on the clock
@@ -353,7 +380,8 @@ __device__ __forceinline__ void rows4_dot(const half* const (&w)[4], int nw,
 
 // Sum 32 per-lane values over the wave in 31 shuffles; lane L returns the
 // total of value L (here acc[L / 8][L % 8]).
-__device__ __forceinline__ float wave_transpose_sum(float (&acc)[4][8], int lane) {
+__device__ __forceinline__ float wave_transpose_sum(float (&acc)[4][8],
+                                                    int lane) {
   float v[32];
 #pragma unroll
   for (int r = 0; r < 4; r++)
@@ -380,16 +408,16 @@ __device__ __forceinline__ void zero48(float (&acc)[4][8]) {
 }
 
 #ifndef MONO_FFN_P2_ROWS4  // HC down / up GEMVs at M <= 8 on 4-row wave tasks
-#define MONO_FFN_P2_ROWS4 0
+  #define MONO_FFN_P2_ROWS4 0
 #endif
 #ifndef MONO_FFN_P3_ROWS4
-#define MONO_FFN_P3_ROWS4 0
+  #define MONO_FFN_P3_ROWS4 0
 #endif
 #ifndef MONO_FFN_E1A
-#define MONO_FFN_E1A 0
+  #define MONO_FFN_E1A 0
 #endif
 #ifndef MONO_FFN_ROWU
-#define MONO_FFN_ROWU 4  // row_dot weight loads in flight per lane
+  #define MONO_FFN_ROWU 4  // row_dot weight loads in flight per lane
 #endif
 // Today's decode GEMV loop (RowF16::dot in rdna_fused_glue.cu), K range
 // [k8_lo, k8_hi): one weight row per wave, lanes stride K, 4 loads in flight.
@@ -415,7 +443,8 @@ __device__ __forceinline__ void row_dot(const half* __restrict__ w,
 #pragma unroll
         for (int m = 0; m < MT; m++) {
           if (m < M) {
-            const uint4 xq = reinterpret_cast<const uint4*>(x + (size_t)m * ldx)[idx];
+            const uint4 xq =
+                reinterpret_cast<const uint4*>(x + (size_t)m * ldx)[idx];
             const half2* xh = reinterpret_cast<const half2*>(&xq);
             float a = acc[m];
             a = __builtin_amdgcn_fdot2(wh[0], xh[0], a, false);
@@ -434,9 +463,9 @@ __device__ __forceinline__ void row_dot(const half* __restrict__ w,
 // lane, and every activation load serves both rows. acc[0][m], acc[1][m].
 template <int MT>
 __device__ __forceinline__ void row_dot2(const half* __restrict__ w,
-                                         const half* __restrict__ x, int ldx, int K,
-                                         int M, int k8_lo, int k8_hi, int lane,
-                                         float (&acc)[2][MT]) {
+                                         const half* __restrict__ x, int ldx,
+                                         int K, int M, int k8_lo, int k8_hi,
+                                         int lane, float (&acc)[2][MT]) {
   const uint4* w0 = reinterpret_cast<const uint4*>(w);
   const uint4* w1 = reinterpret_cast<const uint4*>(w + K);
   for (int i = k8_lo + lane; i < k8_hi; i += 32 * 4) {
@@ -456,7 +485,8 @@ __device__ __forceinline__ void row_dot2(const half* __restrict__ w,
 #pragma unroll
         for (int m = 0; m < MT; m++) {
           if (m < M) {
-            const uint4 xq = reinterpret_cast<const uint4*>(x + (size_t)m * ldx)[idx];
+            const uint4 xq =
+                reinterpret_cast<const uint4*>(x + (size_t)m * ldx)[idx];
             const half2* xh = reinterpret_cast<const half2*>(&xq);
             float a0 = acc[0][m], a1 = acc[1][m];
 #pragma unroll
@@ -498,14 +528,15 @@ __device__ __forceinline__ void wg_tile_tn(AL aload, BR brow, int kb, int ke,
 #pragma unroll
     for (int i = 0; i < A_LD; i++) {
       const int idx = t + NT * i;
-      ra[i] = idx < BM * 4 ? aload(idx / 4, k0 + (idx % 4) * 8) : make_uint4(0, 0, 0, 0);
+      ra[i] = idx < BM * 4 ? aload(idx / 4, k0 + (idx % 4) * 8)
+                           : make_uint4(0, 0, 0, 0);
     }
 #pragma unroll
     for (int i = 0; i < B_LD; i++) {
       const int idx = t + NT * i;
-      rb[i] = idx < BN * 4
-                  ? *reinterpret_cast<const uint4*>(brow(idx / 4) + k0 + (idx % 4) * 8)
-                  : make_uint4(0, 0, 0, 0);
+      rb[i] = idx < BN * 4 ? *reinterpret_cast<const uint4*>(brow(idx / 4) +
+                                                             k0 + (idx % 4) * 8)
+                           : make_uint4(0, 0, 0, 0);
     }
   };
   auto stage = [&]() {
@@ -515,7 +546,8 @@ __device__ __forceinline__ void wg_tile_tn(AL aload, BR brow, int kb, int ke,
       if (idx < BM * 4) {
         const half2* hv = reinterpret_cast<const half2*>(&ra[i]);
 #pragma unroll
-        for (int q = 0; q < 4; q++) As[((idx % 4) * 4 + q) * SA + idx / 4] = hv[q];
+        for (int q = 0; q < 4; q++)
+          As[((idx % 4) * 4 + q) * SA + idx / 4] = hv[q];
       }
     }
 #pragma unroll
@@ -524,7 +556,8 @@ __device__ __forceinline__ void wg_tile_tn(AL aload, BR brow, int kb, int ke,
       if (idx < BN * 4) {
         const half2* hv = reinterpret_cast<const half2*>(&rb[i]);
 #pragma unroll
-        for (int q = 0; q < 4; q++) Bs[((idx % 4) * 4 + q) * SB + idx / 4] = hv[q];
+        for (int q = 0; q < 4; q++)
+          Bs[((idx % 4) * 4 + q) * SB + idx / 4] = hv[q];
       }
     }
   };
@@ -588,9 +621,10 @@ __device__ __forceinline__ void q4_cols4(const uint32_t* __restrict__ wq,
     uint4 w[U];
 #pragma unroll
     for (int u = 0; u < U; u++)
-      w[u] = (k0 + u < k8_hi)
-                 ? *reinterpret_cast<const uint4*>(wq + (size_t)(k0 + u) * N + col)
-                 : make_uint4(0, 0, 0, 0);
+      w[u] =
+          (k0 + u < k8_hi)
+              ? *reinterpret_cast<const uint4*>(wq + (size_t)(k0 + u) * N + col)
+              : make_uint4(0, 0, 0, 0);
 #pragma unroll
     for (int u = 0; u < U; u++) {
       const int k8 = k0 + u;
@@ -602,7 +636,10 @@ __device__ __forceinline__ void q4_cols4(const uint32_t* __restrict__ wq,
         uint2 ssel = sw[0];
 #pragma unroll
         for (int t = 1; t < kMaxG; t++)
-          if (q == t) { zsel = zw[t]; ssel = sw[t]; }
+          if (q == t) {
+            zsel = zw[t];
+            ssel = sw[t];
+          }
         if (q >= kMaxG) {  // slices longer than kMaxG groups: load on demand
           const int g = g_lo + q;
           zsel = zq[(size_t)g * (N / 8) + col / 8];
@@ -690,15 +727,18 @@ __device__ __forceinline__ void tiled_q4(const uint32_t* __restrict__ wq,
 
 // K slice (in K8 rows, a multiple of kTK8 up to kmax) for the tiled tasks:
 // minimize rounds over the grid x (slice + fixed cost).
-__device__ __forceinline__ int tiled_kslice(int base, int K8, int kmax, int units,
-                                            int ovh) {
+__device__ __forceinline__ int tiled_kslice(int base, int K8, int kmax,
+                                            int units, int ovh) {
   constexpr int kTK8 = 32;
   int best = 0x7fffffff, kp = kTK8;
   for (int k = kTK8; k <= max(kTK8, min(kmax, K8)); k += kTK8) {
     const int nk = (K8 + k - 1) / k;
     const int rounds = (base * nk + units - 1) / units;
     const int sc = rounds * (k + ovh);
-    if (sc < best) { best = sc; kp = k; }
+    if (sc < best) {
+      best = sc;
+      kp = k;
+    }
   }
   return kp;
 }
@@ -710,26 +750,27 @@ __device__ __forceinline__ void q4_prep(const uint32_t* z, const half* s,
                                         half2& sc) {
   const uint32_t zw = z[(size_t)group * (N / 8) + col / 8];
   const uint32_t zero = (zw >> ((col & 7) * 4)) & 0xF;
-  vllm::gptq_rdna2::prep_zero_scale_fp16(zero + zoff, __float2half_rn(1.0f),
-                                         zz, yy);
+  vllm::gptq_rdna2::prep_zero_scale_fp16(zero + zoff, __float2half_rn(1.0f), zz,
+                                         yy);
   sc = __half2half2(s[(size_t)group * N + col]);
 }
 
 // ------------------------------------------------------------------ kernel
 #ifndef MONO_FFN_MIN_BLOCKS
-#define MONO_FFN_MIN_BLOCKS 1
+  #define MONO_FFN_MIN_BLOCKS 1
 #endif
 #ifndef MONO_FFN_TILED_BIG
-#define MONO_FFN_TILED_BIG 0
+  #define MONO_FFN_TILED_BIG 0
 #endif
 #ifndef MONO_FFN_TILE_MIN
-#define MONO_FFN_TILE_MIN 5  // row bucket from which the HC / router GEMVs use LDS tiles
+  #define MONO_FFN_TILE_MIN \
+    5  // row bucket from which the HC / router GEMVs use LDS tiles
 #endif
 #ifndef MONO_FFN_TILE_HC
-#define MONO_FFN_TILE_HC 1
+  #define MONO_FFN_TILE_HC 1
 #endif
 #ifndef MONO_FFN_TILED_WPE
-#define MONO_FFN_TILED_WPE 4  // waves per SIMD the tiled variant is built for
+  #define MONO_FFN_TILED_WPE 4  // waves per SIMD the tiled variant is built for
 #endif
 // MT <= 8: today's per-row GEMV loops, <= 128 VGPRs, two WGs (16 waves) per
 // CU. MT > 8: 4x8 register-tiled GEMVs, one WG per CU (MONO_FFN_MIN_BLOCKS).
@@ -741,21 +782,22 @@ __global__ void __launch_bounds__(kThreads)
   // <= 128 VGPRs, two WGs (16 waves) per CU. Tiled path (MONO_FFN_TILED_BIG
   // for MT > 8): 4x8 register tiles, one WG per CU.
   constexpr bool kRow = MT <= 8 || !MONO_FFN_TILED_BIG;
-  constexpr int MC = MT < 8 ? MT : 8;          // activation rows per pass
-  constexpr int NR = kRow ? 4 : kRowChunk;     // expert rows per pass
+  constexpr int MC = MT < 8 ? MT : 8;       // activation rows per pass
+  constexpr int NR = kRow ? 4 : kRowChunk;  // expert rows per pass
 #ifndef MONO_FFN_GTOPK_MIN
-#define MONO_FFN_GTOPK_MIN 8  // rows above which top-k runs one row per grid wave
+  #define MONO_FFN_GTOPK_MIN \
+    8  // rows above which top-k runs one row per grid wave
 #endif
 #ifndef MONO_FFN_P5T_OVH
-#define MONO_FFN_P5T_OVH 16
+  #define MONO_FFN_P5T_OVH 16
 #endif
 #ifndef MONO_FFN_P6T_OVH
-#define MONO_FFN_P6T_OVH 16
+  #define MONO_FFN_P6T_OVH 16
 #endif
 #ifndef MONO_FFN_UNR
-#define MONO_FFN_UNR 4
+  #define MONO_FFN_UNR 4
 #endif
-  constexpr int UNR = MONO_FFN_UNR;            // int4 rows in flight
+  constexpr int UNR = MONO_FFN_UNR;  // int4 rows in flight
   // M > 8: the HC GEMVs run as LDS-tiled WG tasks (today's M > 8 kernels).
   constexpr bool kTileHC = MT >= MONO_FFN_TILE_MIN && MONO_FFN_TILE_HC;
   __shared__ int s_flag;
@@ -763,9 +805,9 @@ __global__ void __launch_bounds__(kThreads)
   __shared__ half s_lora[kMaxM * 320];  // P3 lora; reused as the P5 SE act
   __shared__ int s_tid[kMaxPairs];
   __shared__ float s_tw[kMaxPairs];
-  __shared__ int s_used[kLocalE];          // used-expert slot -> local expert
-  __shared__ int s_ucnt[kLocalE];          // rows per used expert
-  __shared__ int s_slot[kLocalE];          // local expert -> used slot (-1)
+  __shared__ int s_used[kLocalE];            // used-expert slot -> local expert
+  __shared__ int s_ucnt[kLocalE];            // rows per used expert
+  __shared__ int s_slot[kLocalE];            // local expert -> used slot (-1)
   __shared__ short s_urow[kLocalE * kMaxM];  // pair ids per used expert
   __shared__ int s_nused;
   half* const s_seact = s_lora;  // shared-expert activation (P5), M x Ise
@@ -777,10 +819,12 @@ __global__ void __launch_bounds__(kThreads)
 
   if (err_set(p.ctrl)) {  // fail-stop: a previous launch timed out
     for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
-      p.out[i] = __float2half(__int_as_float(0x7fc00000));  // NaN, not stale data
+      p.out[i] =
+          __float2half(__int_as_float(0x7fc00000));  // NaN, not stale data
     return;
   }
-  unsigned long long* const sc = p.stats ? p.stats + kStatRows * kStatCols : nullptr;
+  unsigned long long* const sc =
+      p.stats ? p.stats + kStatRows * kStatCols : nullptr;
   const bool timing = sc && sc[3] != 0;
   if (timing && tid == 0) {
     const unsigned long long t = wall_clock64();
@@ -793,11 +837,16 @@ __global__ void __launch_bounds__(kThreads)
   }
 
   // ---------------- P1: combine + grouped RMSNorm; zero scratch
-  for (int i = wg * kThreads + tid; i < M * ND; i += G * kThreads) p.dai[i] = 0.f;
-  for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads) p.acc[i] = 0.f;
-  for (int i = wg * kThreads + tid; i < M * p.E; i += G * kThreads) p.logits[i] = 0.f;
-  for (int i = wg * kThreads + tid; i < M * 2 * p.Ise; i += G * kThreads) p.se_g[i] = 0.f;
-  for (int i = wg * kThreads + tid; i < M; i += G * kThreads) p.se_gate[i] = 0.f;
+  for (int i = wg * kThreads + tid; i < M * ND; i += G * kThreads)
+    p.dai[i] = 0.f;
+  for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
+    p.acc[i] = 0.f;
+  for (int i = wg * kThreads + tid; i < M * p.E; i += G * kThreads)
+    p.logits[i] = 0.f;
+  for (int i = wg * kThreads + tid; i < M * 2 * p.Ise; i += G * kThreads)
+    p.se_g[i] = 0.f;
+  for (int i = wg * kThreads + tid; i < M; i += G * kThreads)
+    p.se_gate[i] = 0.f;
   if (p.gdn && wg == 0 && tid < 4) p.ctrl->gwork[tid] = 0;
   for (int item = wg; item < M * kHC; item += G) {
     const int m = item / kHC, c = item % kHC;
@@ -807,7 +856,8 @@ __global__ void __launch_bounds__(kThreads)
     half* ro = p.res_out + (size_t)m * HCH + c * H;
     float ss = 0.f;
     for (int h = tid; h < H; h += kThreads) {
-      const half o = __float2half(__half2float(rr[h]) + __half2float(bb[h]) * injc);
+      const half o =
+          __float2half(__half2float(rr[h]) + __half2float(bb[h]) * injc);
       ro[h] = o;
       const float of = __half2float(o);
       ss += of * of;
@@ -838,7 +888,8 @@ __global__ void __launch_bounds__(kThreads)
           const int g = t % NG, sidx = t / NG;
           const int lo = sidx * chunk, hi = min(K8, lo + chunk);
           for (int r = 0; r < min(4, ND - 4 * g); r++)
-            touch16(p.wd + (size_t)(4 * g + r) * HCH + lo * 8, hi - lo, tt, sink, rel);
+            touch16(p.wd + (size_t)(4 * g + r) * HCH + lo * 8, hi - lo, tt,
+                    sink, rel);
         }
     };
     if (!grid_barrier(p, 1, &s_flag, pf)) return;
@@ -861,11 +912,12 @@ __global__ void __launch_bounds__(kThreads)
         for (int j = 0; j < NC; j++) acc[i][j] = 0.f;
       wg_tile_tn<TX, TY, TM, NC>(
           [&](int r, int k) {
-            return r < M ? *reinterpret_cast<const uint4*>(p.xn + (size_t)r * HCH + k)
+            return r < M ? *reinterpret_cast<const uint4*>(p.xn +
+                                                           (size_t)r * HCH + k)
                          : make_uint4(0, 0, 0, 0);
           },
-          [&](int n) { return p.wd + (size_t)min(n0 + n, ND - 1) * HCH; },
-          kb, min(HCH, kb + kps), reinterpret_cast<half2*>(s_lora), acc);
+          [&](int n) { return p.wd + (size_t)min(n0 + n, ND - 1) * HCH; }, kb,
+          min(HCH, kb + kps), reinterpret_cast<half2*>(s_lora), acc);
       const int tx = tid % TX, ty = tid / TX;
 #pragma unroll
       for (int i = 0; i < TM; i++) {
@@ -878,7 +930,8 @@ __global__ void __launch_bounds__(kThreads)
         }
       }
     }
-  } else if constexpr (kRow && !MONO_FFN_P2_ROWS4) {  // wave per row, K split, fp32 atomics
+  } else if constexpr (kRow && !MONO_FFN_P2_ROWS4) {  // wave per row, K split,
+                                                      // fp32 atomics
     const int K8 = HCH / 8;
     const int ksplit = max(1, (2 * GW + ND - 1) / ND);
     const int chunk = (K8 + ksplit - 1) / ksplit;
@@ -889,8 +942,8 @@ __global__ void __launch_bounds__(kThreads)
         float a[MC];
 #pragma unroll
         for (int m = 0; m < MC; m++) a[m] = 0.f;
-        row_dot<MC>(p.wd + (size_t)r * HCH, p.xn + (size_t)m0 * HCH, HCH, M - m0,
-                    lo, hi, lane, a);
+        row_dot<MC>(p.wd + (size_t)r * HCH, p.xn + (size_t)m0 * HCH, HCH,
+                    M - m0, lo, hi, lane, a);
         wave_sum<MC>(a);
         if (lane == 0) {
 #pragma unroll
@@ -899,8 +952,7 @@ __global__ void __launch_bounds__(kThreads)
         }
       }
     }
-  } else
-  {
+  } else {
     const int K8 = HCH / 8, NG = (ND + 3) / 4;
     const int ksplit = max(1, (2 * GW + NG - 1) / NG);
     const int chunk = (K8 + ksplit - 1) / ksplit;
@@ -910,7 +962,8 @@ __global__ void __launch_bounds__(kThreads)
       const int nw = min(4, ND - 4 * g);
       const half* w[4];
 #pragma unroll
-      for (int r = 0; r < 4; r++) w[r] = p.wd + (size_t)min(4 * g + r, ND - 1) * HCH;
+      for (int r = 0; r < 4; r++)
+        w[r] = p.wd + (size_t)min(4 * g + r, ND - 1) * HCH;
       for (int m0 = 0; m0 < M; m0 += 8) {
         float acc[4][8];
         zero48(acc);
@@ -965,7 +1018,9 @@ __global__ void __launch_bounds__(kThreads)
             }
             return v;
           },
-          [&](int n) { return p.wu + (size_t)((n % kHC) * H + h0 + n / kHC) * R; },
+          [&](int n) {
+            return p.wu + (size_t)((n % kHC) * H + h0 + n / kHC) * R;
+          },
           0, R, reinterpret_cast<half2*>(s_lora), acc);
       const int tx = tid % TX, ty = tid / TX, h = h0 + tx;
 #pragma unroll
@@ -974,14 +1029,18 @@ __global__ void __launch_bounds__(kThreads)
         if (row >= M) continue;
         float mix = 0.f;
 #pragma unroll
-        for (int c = 0; c < kHC; c++) {  // the M > 8 path rounds the gate to fp16
+        for (int c = 0; c < kHC;
+             c++) {  // the M > 8 path rounds the gate to fp16
           const float g = __half2float(__float2half(acc[i][c]));
-          mix += sigmoid_f(g) * __half2float(p.xn[(size_t)row * HCH + c * H + h]);
+          mix +=
+              sigmoid_f(g) * __half2float(p.xn[(size_t)row * HCH + c * H + h]);
         }
         p.bin[(size_t)row * H + h] = __float2half(mix * (1.f / kHC));
       }
     }
-  } else if constexpr (kRow && !MONO_FFN_P3_ROWS4) {  // today's hc_up_gate_mix_k loop, wave per h
+  } else if constexpr (kRow &&
+                       !MONO_FFN_P3_ROWS4) {  // today's hc_up_gate_mix_k loop,
+                                              // wave per h
     for (int h = gw; h < H; h += GW) {
       for (int m0 = 0; m0 < M; m0 += MC) {
         float mix[MC];
@@ -992,8 +1051,8 @@ __global__ void __launch_bounds__(kThreads)
           float a[MC];
 #pragma unroll
           for (int m = 0; m < MC; m++) a[m] = 0.f;
-          row_dot<MC>(p.wu + (size_t)(c * H + h) * R, s_lora + m0 * R, R, M - m0, 0,
-                      R / 8, lane, a);
+          row_dot<MC>(p.wu + (size_t)(c * H + h) * R, s_lora + m0 * R, R,
+                      M - m0, 0, R / 8, lane, a);
           wave_sum<MC>(a);
 #pragma unroll
           for (int m = 0; m < MC; m++)
@@ -1004,28 +1063,30 @@ __global__ void __launch_bounds__(kThreads)
         if (lane == 0) {
 #pragma unroll
           for (int m = 0; m < MC; m++)
-            if (m0 + m < M) p.bin[(size_t)(m0 + m) * H + h] = __float2half(mix[m] / kHC);
+            if (m0 + m < M)
+              p.bin[(size_t)(m0 + m) * H + h] = __float2half(mix[m] / kHC);
         }
       }
     }
   } else
-  for (int h = gw; h < H; h += GW) {
-    const half* w[4];
+    for (int h = gw; h < H; h += GW) {
+      const half* w[4];
 #pragma unroll
-    for (int c = 0; c < 4; c++) w[c] = p.wu + (size_t)(c * H + h) * R;
-    for (int m0 = 0; m0 < M; m0 += 8) {
-      const int c = lane / 8, m = m0 + lane % 8;
-      const float xv = m < M ? __half2float(p.xn[(size_t)m * HCH + c * H + h]) : 0.f;
-      float acc[4][8];
-      zero48(acc);
-      rows4_dot(w, 4, s_lora, R, m0, M, 0, R / 8, lane, acc);
-      float v = wave_transpose_sum(acc, lane);
-      v = (m < M) ? sigmoid_f(v) * xv : 0.f;
-      v += __shfl_xor(v, 8);
-      v += __shfl_xor(v, 16);
-      if (lane < 8 && m < M) p.bin[(size_t)m * H + h] = __float2half(v / kHC);
+      for (int c = 0; c < 4; c++) w[c] = p.wu + (size_t)(c * H + h) * R;
+      for (int m0 = 0; m0 < M; m0 += 8) {
+        const int c = lane / 8, m = m0 + lane % 8;
+        const float xv =
+            m < M ? __half2float(p.xn[(size_t)m * HCH + c * H + h]) : 0.f;
+        float acc[4][8];
+        zero48(acc);
+        rows4_dot(w, 4, s_lora, R, m0, M, 0, R / 8, lane, acc);
+        float v = wave_transpose_sum(acc, lane);
+        v = (m < M) ? sigmoid_f(v) * xv : 0.f;
+        v += __shfl_xor(v, 8);
+        v += __shfl_xor(v, 16);
+        if (lane < 8 && m < M) p.bin[(size_t)m * H + h] = __float2half(v / kHC);
+      }
     }
-  }
   {
     const int K8 = H / 8;
     const int NR = (p.E + 3) / 4, NS = p.Ise / 2, NT = NR + NS + 1;
@@ -1038,12 +1099,14 @@ __global__ void __launch_bounds__(kThreads)
           const int lo = sidx * chunk, hi = min(K8, lo + chunk);
           if (g < NR) {
             for (int r = 0; r < min(4, p.E - 4 * g); r++)
-              touch16(p.wr + (size_t)(4 * g + r) * H + lo * 8, hi - lo, tt, sink, rel);
+              touch16(p.wr + (size_t)(4 * g + r) * H + lo * 8, hi - lo, tt,
+                      sink, rel);
           } else if (g < NR + NS) {
             const int i0 = 2 * (g - NR);
             const int rr[4] = {i0, i0 + 1, p.Ise + i0, p.Ise + i0 + 1};
             for (int r = 0; r < 4; r++)
-              touch16(p.se_w1 + (size_t)rr[r] * H + lo * 8, hi - lo, tt, sink, rel);
+              touch16(p.se_w1 + (size_t)rr[r] * H + lo * 8, hi - lo, tt, sink,
+                      rel);
           }
         }
     };
@@ -1052,23 +1115,24 @@ __global__ void __launch_bounds__(kThreads)
   }
   if (wg == 0 && tid == 0) p.ctrl->ts[3] = wall_clock64();
 
-#if MONO_FFN_E1A  // E1a GDN mode (reference only; off: it costs the FFN path ~25%)
+#if MONO_FFN_E1A  // E1a GDN mode (reference only; off: it costs the FFN path
+                  // ~25%)
   if (p.gdn) {
     // fp16 GEMV out[m, col0 + n] = W[n, :] . X[m, :]: two output rows per wave
     // over the whole K, all M rows in one pass (row_dot2).
-    auto gemv_fx = [&](const half* W, int NRows, int K, const half* X, Fx* out, int ldo,
-                       int col0, int ctr) {
+    auto gemv_fx = [&](const half* W, int NRows, int K, const half* X, Fx* out,
+                       int ldo, int col0, int ctr) {
       const int K8 = K / 8;
       (void)ctr;
       for (int r = 2 * gw; r < NRows; r += 2 * GW) {  // NRows is even
         float a[2][MT];
-#pragma unroll
+  #pragma unroll
         for (int m = 0; m < MT; m++) a[0][m] = a[1][m] = 0.f;
         row_dot2<MT>(W + (size_t)r * K, X, K, K, M, 0, K8, lane, a);
         wave_sum<MT>(a[0]);
         wave_sum<MT>(a[1]);
         if (lane == 0) {
-#pragma unroll
+  #pragma unroll
           for (int m = 0; m < MT; m++)
             if (m < M) {
               out[(size_t)m * ldo + col0 + r] = a[0][m];
@@ -1089,7 +1153,8 @@ __global__ void __launch_bounds__(kThreads)
     // RMSNorm. Reference rounding: projections, conv output, state readout and
     // norm output in fp16.
     {
-      float* sf = reinterpret_cast<float*>(s_lora);  // q[128] k[128] v[128] o[128]
+      float* sf =
+          reinterpret_cast<float*>(s_lora);  // q[128] k[128] v[128] o[128]
       float* sq = sf;
       float* sk = sf + 128;
       float* sv = sf + 256;
@@ -1101,14 +1166,15 @@ __global__ void __launch_bounds__(kThreads)
       for (int t = wg; t < M * kGdnHV; t += G) {
         const int m = t / kGdnHV, hv = t % kGdnHV, h = hv / REP;
         const long slot = p.g_sidx[m];
-        if (slot <= 0 || slot >= p.g_slots) {  // null / padded row: zero, no state
+        if (slot <= 0 ||
+            slot >= p.g_slots) {  // null / padded row: zero, no state
           for (int i = tid; i < kGdnV; i += kThreads)
             p.g_y[(size_t)m * kGdnVD + hv * kGdnV + i] = __float2half(0.f);
           continue;
         }
         for (int i = tid; i < 3 * 128; i += kThreads) {
           const int seg = i / 128, j = i % 128;
-          const int ch = seg == 0 ? h * kGdnK + j
+          const int ch = seg == 0   ? h * kGdnK + j
                          : seg == 1 ? kGdnH * kGdnK + h * kGdnK + j
                                     : kGdnQK + hv * kGdnV + j;
           half* cs = p.g_convs + slot * p.g_cs_slot + (long)ch * p.g_cs_dim;
@@ -1126,7 +1192,8 @@ __global__ void __launch_bounds__(kThreads)
             cs[0] = __float2half(s1);
             cs[p.g_cs_t] = __float2half(s2);
             cs[2 * p.g_cs_t] = __float2half(x);
-          } else if (hv % REP == 0) {  // q|k shared by REP heads: written in P6g
+          } else if (hv % REP ==
+                     0) {  // q|k shared by REP heads: written in P6g
             half* st = p.g_st + ((size_t)m * kGdnQK + ch) * 3;
             st[0] = __float2half(s1);
             st[1] = __float2half(s2);
@@ -1136,13 +1203,13 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
         const int v_local = tid >> 3, ks = tid & 7, k0 = ks * 16;
         float q[16], kk[16];
-#pragma unroll
+  #pragma unroll
         for (int j = 0; j < 16; ++j) {
           q[j] = sq[k0 + j];
           kk[j] = sk[k0 + j];
         }
         float nq = 0.f, nk = 0.f;
-#pragma unroll
+  #pragma unroll
         for (int j = 0; j < 16; ++j) {
           nq += q[j] * q[j];
           nk += kk[j] * kk[j];
@@ -1153,7 +1220,7 @@ __global__ void __launch_bounds__(kThreads)
         }
         const float q_scale = p.g_scale / sqrtf(nq + 1e-6f);
         const float k_scale = 1.0f / sqrtf(nk + 1e-6f);
-#pragma unroll
+  #pragma unroll
         for (int j = 0; j < 16; ++j) {
           q[j] *= q_scale;
           kk[j] *= k_scale;
@@ -1163,25 +1230,27 @@ __global__ void __launch_bounds__(kThreads)
         const float xg = a_val + p.g_dtb[hv];
         const float softplus = xg <= 20.f ? logf(1.f + expf(xg)) : xg;
         const float decay = expf(-expf(p.g_alog[hv]) * softplus);
-        const float beta = __half2float(__float2half(1.f / (1.f + expf(-b_val))));
+        const float beta =
+            __half2float(__float2half(1.f / (1.f + expf(-b_val))));
         for (int it = 0; it < kGdnV / 32; it++) {
           const int o_v = it * 32 + v_local;
-          float* ph = p.g_ssm + slot * p.g_ss_slot + ((long)hv * kGdnV + o_v) * kGdnK + k0;
+          float* ph = p.g_ssm + slot * p.g_ss_slot +
+                      ((long)hv * kGdnV + o_v) * kGdnK + k0;
           float hs[16];
-#pragma unroll
+  #pragma unroll
           for (int j = 0; j < 16; ++j) hs[j] = ph[j] * decay;
           float acc = 0.f;
-#pragma unroll
+  #pragma unroll
           for (int j = 0; j < 16; ++j) acc += hs[j] * kk[j];
           for (int off = 1; off <= 4; off <<= 1) acc += __shfl_xor(acc, off);
           const float v2 = (sv[o_v] - acc) * beta;
-#pragma unroll
+  #pragma unroll
           for (int j = 0; j < 16; ++j) hs[j] += v2 * kk[j];
           float oa = 0.f;
-#pragma unroll
+  #pragma unroll
           for (int j = 0; j < 16; ++j) oa += hs[j] * q[j];
           for (int off = 1; off <= 4; off <<= 1) oa += __shfl_xor(oa, off);
-#pragma unroll
+  #pragma unroll
           for (int j = 0; j < 16; ++j) ph[j] = hs[j];
           if (ks == 0) so[o_v] = __half2float(__float2half(oa));
         }
@@ -1193,7 +1262,7 @@ __global__ void __launch_bounds__(kThreads)
         if (lane == 0) s_red[wave] = ss;
         __syncthreads();
         float tot = 0.f;
-#pragma unroll
+  #pragma unroll
         for (int w8 = 0; w8 < kWaves; w8++) tot += s_red[w8];
         const float rstd = rsqrtf(tot / kGdnV + p.g_eps);
         for (int i = tid; i < kGdnV; i += kThreads) {
@@ -1212,7 +1281,8 @@ __global__ void __launch_bounds__(kThreads)
     // ---------------- P6g: out_proj (rank partial) + deferred q|k conv state
     gemv_fx(p.g_wo, H, kGdnVD, p.g_y, p.acc, H, 0, 2);
     for (int i = wg * kThreads + tid; i < M * kGdnQK * 3; i += G * kThreads) {
-      const int m = i / (kGdnQK * 3), r = i % (kGdnQK * 3), ch = r / 3, j = r % 3;
+      const int m = i / (kGdnQK * 3), r = i % (kGdnQK * 3), ch = r / 3,
+                j = r % 3;
       const long slot = p.g_sidx[m];
       if (slot <= 0 || slot >= p.g_slots) continue;
       p.g_convs[slot * p.g_cs_slot + (long)ch * p.g_cs_dim + j * p.g_cs_t] =
@@ -1224,377 +1294,408 @@ __global__ void __launch_bounds__(kThreads)
 #endif
   {
 
-  // ---------------- P4: router (fp32 logits), shared-expert gate_up, expert
-  // gate; K split, fp32 atomics.
-  if constexpr (kTileHC) {  // same 32 x 64 LDS tiles over the E + 2*Ise + 1 rows
-    constexpr int TX = 32, TY = 8, TM = MT <= 16 ? 2 : 4, NC = 2, BN = TX * NC;
-    const int NTOT = p.E + 2 * p.Ise + 1;
-    const int nblk = (NTOT + BN - 1) / BN;
-    const int splits = max(1, min(20, (2 * G + nblk - 1) / nblk));
-    const int kps = ((H + splits - 1) / splits + 31) / 32 * 32;
-    const int nsplit = (H + kps - 1) / kps;
-    for (int t = wg; t < nblk * nsplit; t += G) {
-      const int n0 = (t % nblk) * BN, kb = (t / nblk) * kps;
-      float acc[TM][NC];
+    // ---------------- P4: router (fp32 logits), shared-expert gate_up, expert
+    // gate; K split, fp32 atomics.
+    if constexpr (kTileHC) {  // same 32 x 64 LDS tiles over the E + 2*Ise + 1
+                              // rows
+      constexpr int TX = 32, TY = 8, TM = MT <= 16 ? 2 : 4, NC = 2,
+                    BN = TX * NC;
+      const int NTOT = p.E + 2 * p.Ise + 1;
+      const int nblk = (NTOT + BN - 1) / BN;
+      const int splits = max(1, min(20, (2 * G + nblk - 1) / nblk));
+      const int kps = ((H + splits - 1) / splits + 31) / 32 * 32;
+      const int nsplit = (H + kps - 1) / kps;
+      for (int t = wg; t < nblk * nsplit; t += G) {
+        const int n0 = (t % nblk) * BN, kb = (t / nblk) * kps;
+        float acc[TM][NC];
 #pragma unroll
-      for (int i = 0; i < TM; i++)
+        for (int i = 0; i < TM; i++)
 #pragma unroll
-        for (int j = 0; j < NC; j++) acc[i][j] = 0.f;
-      wg_tile_tn<TX, TY, TM, NC>(
-          [&](int r, int k) {
-            return r < M ? *reinterpret_cast<const uint4*>(p.bin + (size_t)r * H + k)
-                         : make_uint4(0, 0, 0, 0);
-          },
-          [&](int n) {
-            const int r = min(n0 + n, NTOT - 1);
-            return r < p.E ? p.wr + (size_t)r * H
-                 : r < p.E + 2 * p.Ise ? p.se_w1 + (size_t)(r - p.E) * H : p.se_wg;
-          },
-          kb, min(H, kb + kps), reinterpret_cast<half2*>(s_lora), acc);
-      const int tx = tid % TX, ty = tid / TX;
+          for (int j = 0; j < NC; j++) acc[i][j] = 0.f;
+        wg_tile_tn<TX, TY, TM, NC>(
+            [&](int r, int k) {
+              return r < M ? *reinterpret_cast<const uint4*>(p.bin +
+                                                             (size_t)r * H + k)
+                           : make_uint4(0, 0, 0, 0);
+            },
+            [&](int n) {
+              const int r = min(n0 + n, NTOT - 1);
+              return r < p.E               ? p.wr + (size_t)r * H
+                     : r < p.E + 2 * p.Ise ? p.se_w1 + (size_t)(r - p.E) * H
+                                           : p.se_wg;
+            },
+            kb, min(H, kb + kps), reinterpret_cast<half2*>(s_lora), acc);
+        const int tx = tid % TX, ty = tid / TX;
 #pragma unroll
-      for (int i = 0; i < TM; i++) {
-        const int m = ty * TM + i;
-        if (m >= M) continue;
+        for (int i = 0; i < TM; i++) {
+          const int m = ty * TM + i;
+          if (m >= M) continue;
 #pragma unroll
-        for (int j = 0; j < NC; j++) {
-          const int r = n0 + tx * NC + j;
-          if (r < p.E) atomicAdd(&p.logits[m * p.E + r], acc[i][j]);
-          else if (r < p.E + 2 * p.Ise) atomicAdd(&p.se_g[m * 2 * p.Ise + (r - p.E)], acc[i][j]);
-          else if (r < NTOT) atomicAdd(&p.se_gate[m], acc[i][j]);
+          for (int j = 0; j < NC; j++) {
+            const int r = n0 + tx * NC + j;
+            if (r < p.E)
+              atomicAdd(&p.logits[m * p.E + r], acc[i][j]);
+            else if (r < p.E + 2 * p.Ise)
+              atomicAdd(&p.se_g[m * 2 * p.Ise + (r - p.E)], acc[i][j]);
+            else if (r < NTOT)
+              atomicAdd(&p.se_gate[m], acc[i][j]);
+          }
         }
       }
-    }
-  } else if constexpr (kRow) {  // wave per row: E router rows, 2*Ise SE rows, 1 gate
-    const int K8 = H / 8, NT = p.E + 2 * p.Ise + 1;
-    const int ksplit = max(1, GW / NT);
-    const int chunk = (K8 + ksplit - 1) / ksplit;
-    for (int t = gw; t < NT * ksplit; t += GW) {
-      const int r = t % NT, sidx = t / NT;
-      const int lo = sidx * chunk, hi = min(K8, lo + chunk);
-      const half* w = r < p.E ? p.wr + (size_t)r * H
-                    : r < p.E + 2 * p.Ise ? p.se_w1 + (size_t)(r - p.E) * H : p.se_wg;
-      for (int m0 = 0; m0 < M; m0 += MC) {
-        float a[MC];
+    } else if constexpr (kRow) {  // wave per row: E router rows, 2*Ise SE rows,
+                                  // 1 gate
+      const int K8 = H / 8, NT = p.E + 2 * p.Ise + 1;
+      const int ksplit = max(1, GW / NT);
+      const int chunk = (K8 + ksplit - 1) / ksplit;
+      for (int t = gw; t < NT * ksplit; t += GW) {
+        const int r = t % NT, sidx = t / NT;
+        const int lo = sidx * chunk, hi = min(K8, lo + chunk);
+        const half* w = r < p.E               ? p.wr + (size_t)r * H
+                        : r < p.E + 2 * p.Ise ? p.se_w1 + (size_t)(r - p.E) * H
+                                              : p.se_wg;
+        for (int m0 = 0; m0 < M; m0 += MC) {
+          float a[MC];
 #pragma unroll
-        for (int m = 0; m < MC; m++) a[m] = 0.f;
-        row_dot<MC>(w, p.bin + (size_t)m0 * H, H, M - m0, lo, hi, lane, a);
-        wave_sum<MC>(a);
-        if (lane == 0) {
+          for (int m = 0; m < MC; m++) a[m] = 0.f;
+          row_dot<MC>(w, p.bin + (size_t)m0 * H, H, M - m0, lo, hi, lane, a);
+          wave_sum<MC>(a);
+          if (lane == 0) {
 #pragma unroll
-          for (int mm = 0; mm < MC; mm++) {
-            const int m = m0 + mm;
-            if (m < M) {
-              if (r < p.E) atomicAdd(&p.logits[m * p.E + r], a[mm]);
-              else if (r < p.E + 2 * p.Ise) atomicAdd(&p.se_g[m * 2 * p.Ise + (r - p.E)], a[mm]);
-              else atomicAdd(&p.se_gate[m], a[mm]);
+            for (int mm = 0; mm < MC; mm++) {
+              const int m = m0 + mm;
+              if (m < M) {
+                if (r < p.E)
+                  atomicAdd(&p.logits[m * p.E + r], a[mm]);
+                else if (r < p.E + 2 * p.Ise)
+                  atomicAdd(&p.se_g[m * 2 * p.Ise + (r - p.E)], a[mm]);
+                else
+                  atomicAdd(&p.se_gate[m], a[mm]);
+              }
+            }
+          }
+        }
+      }
+    } else {
+      const int K8 = H / 8;
+      const int NR = (p.E + 3) / 4, NS = p.Ise / 2, NT = NR + NS + 1;
+      const int ksplit = max(1, GW / NT);
+      const int chunk = (K8 + ksplit - 1) / ksplit;
+      for (int t = gw; t < NT * ksplit; t += GW) {
+        const int g = t % NT, sidx = t / NT;
+        const int lo = sidx * chunk, hi = min(K8, lo + chunk);
+        const half* w[4];
+        int nw = 4;
+        if (g < NR) {
+          nw = min(4, p.E - 4 * g);
+#pragma unroll
+          for (int r = 0; r < 4; r++)
+            w[r] = p.wr + (size_t)min(4 * g + r, p.E - 1) * H;
+        } else if (g < NR + NS) {
+          const int i0 = 2 * (g - NR);  // gate i0, i0+1 ; up i0, i0+1
+          w[0] = p.se_w1 + (size_t)i0 * H;
+          w[1] = p.se_w1 + (size_t)(i0 + 1) * H;
+          w[2] = p.se_w1 + (size_t)(p.Ise + i0) * H;
+          w[3] = p.se_w1 + (size_t)(p.Ise + i0 + 1) * H;
+        } else {
+          nw = 1;
+#pragma unroll
+          for (int r = 0; r < 4; r++) w[r] = p.se_wg;
+        }
+        for (int m0 = 0; m0 < M; m0 += 8) {
+          float acc[4][8];
+          zero48(acc);
+          rows4_dot(w, nw, p.bin, H, m0, M, lo, hi, lane, acc);
+          const float v = wave_transpose_sum(acc, lane);
+          const int r = lane / 8, m = m0 + lane % 8;
+          if (r < nw && m < M) {
+            if (g < NR) {
+              atomicAdd(&p.logits[m * p.E + 4 * g + r], v);
+            } else if (g < NR + NS) {
+              const int i0 = 2 * (g - NR);
+              const int col = r < 2 ? i0 + r : p.Ise + i0 + (r - 2);
+              atomicAdd(&p.se_g[m * 2 * p.Ise + col], v);
+            } else {
+              atomicAdd(&p.se_gate[m], v);
             }
           }
         }
       }
     }
-  } else {
-    const int K8 = H / 8;
-    const int NR = (p.E + 3) / 4, NS = p.Ise / 2, NT = NR + NS + 1;
-    const int ksplit = max(1, GW / NT);
-    const int chunk = (K8 + ksplit - 1) / ksplit;
-    for (int t = gw; t < NT * ksplit; t += GW) {
-      const int g = t % NT, sidx = t / NT;
-      const int lo = sidx * chunk, hi = min(K8, lo + chunk);
-      const half* w[4];
-      int nw = 4;
-      if (g < NR) {
-        nw = min(4, p.E - 4 * g);
-#pragma unroll
-        for (int r = 0; r < 4; r++) w[r] = p.wr + (size_t)min(4 * g + r, p.E - 1) * H;
-      } else if (g < NR + NS) {
-        const int i0 = 2 * (g - NR);  // gate i0, i0+1 ; up i0, i0+1
-        w[0] = p.se_w1 + (size_t)i0 * H;
-        w[1] = p.se_w1 + (size_t)(i0 + 1) * H;
-        w[2] = p.se_w1 + (size_t)(p.Ise + i0) * H;
-        w[3] = p.se_w1 + (size_t)(p.Ise + i0 + 1) * H;
-      } else {
-        nw = 1;
-#pragma unroll
-        for (int r = 0; r < 4; r++) w[r] = p.se_wg;
-      }
-      for (int m0 = 0; m0 < M; m0 += 8) {
-        float acc[4][8];
-        zero48(acc);
-        rows4_dot(w, nw, p.bin, H, m0, M, lo, hi, lane, acc);
-        const float v = wave_transpose_sum(acc, lane);
-        const int r = lane / 8, m = m0 + lane % 8;
-        if (r < nw && m < M) {
-          if (g < NR) {
-            atomicAdd(&p.logits[m * p.E + 4 * g + r], v);
-          } else if (g < NR + NS) {
-            const int i0 = 2 * (g - NR);
-            const int col = r < 2 ? i0 + r : p.Ise + i0 + (r - 2);
-            atomicAdd(&p.se_g[m * 2 * p.Ise + col], v);
-          } else {
-            atomicAdd(&p.se_gate[m], v);
-          }
-        }
-      }
-    }
-  }
-  if (!grid_barrier(p, 4, &s_flag)) return;
-  if (wg == 0 && tid == 0) p.ctrl->ts[4] = wall_clock64();
+    if (!grid_barrier(p, 4, &s_flag)) return;
+    if (wg == 0 && tid == 0) p.ctrl->ts[4] = wall_clock64();
 
-  // ---------------- P5a: top-k (fp32 softmax, renormalized), every WG.
-  // Radix select on orderable keys with wave ballots (no cross-lane shuffles
-  // per selected expert): T = key of the 10th largest logit; select keys > T
-  // plus the lowest-index ties. Slots follow expert index order (the sums are
-  // fixed point, so the order of pairs does not change any result).
-  // M > GTOPK_MIN: one wave of the grid per row (instead of every WG doing
-  // all rows on its 8 waves), published through the workspace + one barrier.
-  const bool gtopk = M > MONO_FFN_GTOPK_MIN;
-  for (int m = gtopk ? gw : wave; m < M; m += gtopk ? GW : kWaves) {
-    int* const o_tid = gtopk ? p.ctrl->topk_id : s_tid;
-    float* const o_tw = gtopk ? p.ctrl->topw : s_tw;
-    const Fx* lg = p.logits + (size_t)m * p.E;
-    float v[16];
-    unsigned key[16];
-    float mx = -INFINITY;
+    // ---------------- P5a: top-k (fp32 softmax, renormalized), every WG.
+    // Radix select on orderable keys with wave ballots (no cross-lane shuffles
+    // per selected expert): T = key of the 10th largest logit; select keys > T
+    // plus the lowest-index ties. Slots follow expert index order (the sums are
+    // fixed point, so the order of pairs does not change any result).
+    // M > GTOPK_MIN: one wave of the grid per row (instead of every WG doing
+    // all rows on its 8 waves), published through the workspace + one barrier.
+    const bool gtopk = M > MONO_FFN_GTOPK_MIN;
+    for (int m = gtopk ? gw : wave; m < M; m += gtopk ? GW : kWaves) {
+      int* const o_tid = gtopk ? p.ctrl->topk_id : s_tid;
+      float* const o_tw = gtopk ? p.ctrl->topw : s_tw;
+      const Fx* lg = p.logits + (size_t)m * p.E;
+      float v[16];
+      unsigned key[16];
+      float mx = -INFINITY;
 #pragma unroll
-    for (int j = 0; j < 16; j++) {
-      const int e = lane + 32 * j;
-      v[j] = e < p.E ? (float)lg[e] : -INFINITY;
-      mx = fmaxf(mx, v[j]);
-      const unsigned b = __float_as_uint(v[j]);
-      key[j] = e < p.E ? ((b & 0x80000000u) ? ~b : (b | 0x80000000u)) : 0u;
-    }
-    for (int off = 16; off >= 1; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off));
-    unsigned T = 0;
-    for (int bit = 31; bit >= 0; bit--) {
-      const unsigned cand = T | (1u << bit);
-      int cnt = 0;
-#pragma unroll
-      for (int j = 0; j < 16; j++) cnt += __popcll(__ballot(key[j] >= cand));
-      if (cnt >= kTopK) T = cand;
-    }
-    int gt = 0;
-#pragma unroll
-    for (int j = 0; j < 16; j++) gt += __popcll(__ballot(key[j] > T));
-    const int need = kTopK - gt;
-    const unsigned long long lt = (1ull << lane) - 1ull;
-    int nsel = 0, ntie = 0;
-    float sel_sum = 0.f;
-#pragma unroll
-    for (int j = 0; j < 16; j++) {
-      const bool tie = key[j] == T;
-      const unsigned long long tb = __ballot(tie);
-      const bool sel = key[j] > T || (tie && ntie + __popcll(tb & lt) < need);
-      ntie += __popcll(tb);
-      const unsigned long long sb = __ballot(sel);
-      if (sel) {
-        const int slot = nsel + __popcll(sb & lt);
-        const float w = __expf(v[j] - mx);
-        o_tid[m * kTopK + slot] = lane + 32 * j;
-        o_tw[m * kTopK + slot] = w;
-        sel_sum += w;
+      for (int j = 0; j < 16; j++) {
+        const int e = lane + 32 * j;
+        v[j] = e < p.E ? (float)lg[e] : -INFINITY;
+        mx = fmaxf(mx, v[j]);
+        const unsigned b = __float_as_uint(v[j]);
+        key[j] = e < p.E ? ((b & 0x80000000u) ? ~b : (b | 0x80000000u)) : 0u;
       }
-      nsel += __popcll(sb);
+      for (int off = 16; off >= 1; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor(mx, off));
+      unsigned T = 0;
+      for (int bit = 31; bit >= 0; bit--) {
+        const unsigned cand = T | (1u << bit);
+        int cnt = 0;
+#pragma unroll
+        for (int j = 0; j < 16; j++) cnt += __popcll(__ballot(key[j] >= cand));
+        if (cnt >= kTopK) T = cand;
+      }
+      int gt = 0;
+#pragma unroll
+      for (int j = 0; j < 16; j++) gt += __popcll(__ballot(key[j] > T));
+      const int need = kTopK - gt;
+      const unsigned long long lt = (1ull << lane) - 1ull;
+      int nsel = 0, ntie = 0;
+      float sel_sum = 0.f;
+#pragma unroll
+      for (int j = 0; j < 16; j++) {
+        const bool tie = key[j] == T;
+        const unsigned long long tb = __ballot(tie);
+        const bool sel = key[j] > T || (tie && ntie + __popcll(tb & lt) < need);
+        ntie += __popcll(tb);
+        const unsigned long long sb = __ballot(sel);
+        if (sel) {
+          const int slot = nsel + __popcll(sb & lt);
+          const float w = __expf(v[j] - mx);
+          o_tid[m * kTopK + slot] = lane + 32 * j;
+          o_tw[m * kTopK + slot] = w;
+          sel_sum += w;
+        }
+        nsel += __popcll(sb);
+      }
+      for (int off = 16; off >= 1; off >>= 1)
+        sel_sum += __shfl_xor(sel_sum, off);
+      __builtin_amdgcn_wave_barrier();
+      __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "agent");
+      if (lane < kTopK) o_tw[m * kTopK + lane] *= 1.f / sel_sum;
     }
-    for (int off = 16; off >= 1; off >>= 1) sel_sum += __shfl_xor(sel_sum, off);
-    __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "agent");
-    if (lane < kTopK) o_tw[m * kTopK + lane] *= 1.f / sel_sum;
-  }
-  if (gtopk) {
-    if (!grid_barrier(p, 7, &s_flag)) return;
-    for (int i = tid; i < M * kTopK; i += kThreads) {
-      s_tid[i] = __hip_atomic_load(&p.ctrl->topk_id[i], __ATOMIC_RELAXED,
-                                   __HIP_MEMORY_SCOPE_AGENT);
-      s_tw[i] = __hip_atomic_load(&p.ctrl->topw[i], __ATOMIC_RELAXED,
-                                  __HIP_MEMORY_SCOPE_AGENT);
+    if (gtopk) {
+      if (!grid_barrier(p, 7, &s_flag)) return;
+      for (int i = tid; i < M * kTopK; i += kThreads) {
+        s_tid[i] = __hip_atomic_load(&p.ctrl->topk_id[i], __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_AGENT);
+        s_tw[i] = __hip_atomic_load(&p.ctrl->topw[i], __ATOMIC_RELAXED,
+                                    __HIP_MEMORY_SCOPE_AGENT);
+      }
+      __syncthreads();
+    }
+    if (tid == 0 && wg < 256)
+      p.ctrl->wg_done[8][wg] = wall_clock64();  // top-k done (wave 0)
+    for (int e = tid; e < kLocalE; e += kThreads) {
+      s_slot[e] = -1;
+      s_ucnt[e] = 0;
     }
     __syncthreads();
-  }
-  if (tid == 0 && wg < 256) p.ctrl->wg_done[8][wg] = wall_clock64();  // top-k done (wave 0)
-  for (int e = tid; e < kLocalE; e += kThreads) {
-    s_slot[e] = -1;
-    s_ucnt[e] = 0;
-  }
-  __syncthreads();
-  if (tid == 0 && wg < 256) p.ctrl->wg_done[9][wg] = wall_clock64();  // lists reset
-  // local expert lists: mark, prefix over the 128 local experts, then append
-  // the pairs with LDS atomics.
-  for (int pi = tid; pi < M * kTopK; pi += kThreads) {
-    const int le = s_tid[pi] - p.expert_base;
-    if (le >= 0 && le < kLocalE) s_slot[le] = 0;
-  }
-  __syncthreads();
-  if (tid < kLocalE) {  // kLocalE = 128 = 4 waves
-    const bool used = s_slot[tid] == 0;
-    const unsigned long long b = __ballot(used);
-    const int rank = __popcll(b & ((1ull << lane) - 1ull));
-    if (lane == 0) s_red[wave] = __popcll(b);
-    __syncthreads_count(0);
-    int off = 0;
-    for (int w = 0; w < wave; w++) off += (int)s_red[w];
-    if (used) {
-      s_slot[tid] = off + rank;
-      s_used[off + rank] = tid;
-    }
-    if (tid == kLocalE - 1) s_nused = off + __popcll(b);
-  } else {
-    __syncthreads_count(0);
-  }
-  __syncthreads();
-  for (int pi = tid; pi < M * kTopK; pi += kThreads) {
-    const int le = s_tid[pi] - p.expert_base;
-    if (le >= 0 && le < kLocalE) {
-      const int u = s_slot[le];
-      const int r = atomicAdd(&s_ucnt[u], 1);
-      s_urow[u * kMaxM + r] = (short)pi;
-    }
-  }
-  __syncthreads();
-  const int nused = s_nused;
-  if (tid == 0 && wg < 256) p.ctrl->wg_done[7][wg] = wall_clock64();  // P5a done
-  if (wg == 0) {
-    for (int i = tid; i < M * kTopK; i += kThreads) p.ctrl->topk_id[i] = s_tid[i];
-    if (tid == 0) p.ctrl->pad[2] = nused;  // local experts touched (debug)
-  }
-
-  // ---------------- P5b: routed gate_up as WG tiles (today's moe_gemm_q4
-  // decomposition): (used expert, 1024 contiguous gate|up columns, K slice),
-  // activations of the expert's rows staged in LDS, fixed-point partial sums
-  // into p.gu; the K slice is chosen so the tiles fill the grid. Then the
-  // shared-expert down rows. P5c applies SwiGLU after one more barrier.
-  {
-    const int I = p.I, N13 = 2 * I, K8 = H / 8, g8 = p.group / 8;
-    {
-      constexpr int TN = kThreads * 4;
-      const int ntile = (N13 + TN - 1) / TN;
-      const int tb = nused * ntile;
-      const int kp = tiled_kslice(tb, K8, (kMaxM * 320) / (NR * 8) / 32 * 32, G,
-                                  MONO_FFN_P5T_OVH);
-      const int nk = (K8 + kp - 1) / kp;
-      for (int t = wg; t < tb * nk; t += G) {
-        const int sidx = t / tb, uc = t % tb;
-        const int u = uc / ntile, nt = uc % ntile;
-        const int e = s_used[u];
-        const int klo = sidx * kp, khi = min(K8, klo + kp);
-        tiled_q4<NR, UNR>(
-            p.w13 + (size_t)e * K8 * N13, p.s13 + (size_t)e * (H / p.group) * N13,
-            p.z13 + (size_t)e * (H / p.group) * (N13 / 8), N13, g8, p.zero_offset,
-            nt * TN, klo, khi, s_ucnt[u],
-            [&](int r) { return p.bin + (size_t)(s_urow[u * kMaxM + r] / kTopK) * H; },
-            s_lora, [&](int r, int col, const float (&a)[4]) {
-              Fx* dst = p.gu + (size_t)s_urow[u * kMaxM + r] * N13 + col;
-#pragma unroll
-              for (int q = 0; q < 4; q++) atomicAdd(dst + q, a[q]);
-            });
-      }
-    }
-    for (int k = tid; k < M * p.Ise; k += kThreads) {
-      const int m = k / p.Ise, i2 = k % p.Ise;
-      s_seact[k] = __float2half(silu_f(p.se_g[m * 2 * p.Ise + i2]) *
-                                p.se_g[m * 2 * p.Ise + p.Ise + i2]);
-    }
-    __syncthreads();
-    const int Ise8 = p.Ise / 8;
-    if constexpr (kRow) {
-      for (int h = gw; h < H; h += GW) {
-        for (int m0 = 0; m0 < M; m0 += MC) {
-          float a[MC];
-#pragma unroll
-          for (int m = 0; m < MC; m++) a[m] = 0.f;
-          row_dot<MC>(p.se_w2 + (size_t)h * p.Ise, s_seact + m0 * p.Ise, p.Ise, M - m0,
-                      0, Ise8, lane, a);
-          wave_sum<MC>(a);
-          if (lane == 0) {
-#pragma unroll
-            for (int m = 0; m < MC; m++)
-              if (m0 + m < M)
-                p.acc[(size_t)(m0 + m) * H + h] = a[m] * sigmoid_f(p.se_gate[m0 + m]);
-          }
-        }
-      }
-    } else
-    for (int g = gw; g < H / 4; g += GW) {
-      const half* w[4];
-#pragma unroll
-      for (int r = 0; r < 4; r++) w[r] = p.se_w2 + (size_t)(4 * g + r) * p.Ise;
-      for (int m0 = 0; m0 < M; m0 += 8) {
-        float acc[4][8];
-        zero48(acc);
-        rows4_dot(w, 4, s_seact, p.Ise, m0, M, 0, Ise8, lane, acc);
-        const float v = wave_transpose_sum(acc, lane);
-        const int r = lane / 8, m = m0 + lane % 8;
-        if (m < M) p.acc[(size_t)m * H + 4 * g + r] = v * sigmoid_f(p.se_gate[m]);
-      }
-    }
-  }
-  {  // P5c: SwiGLU of the routed sums (reference rounding); consume and clear p.gu
-    if (!grid_barrier(p, 7, &s_flag)) return;
-    const int I = p.I, N13 = 2 * I;
-    for (int i = wg * kThreads + tid; i < M * kTopK * I; i += G * kThreads) {
-      const int pi = i / I, j = i % I;
+    if (tid == 0 && wg < 256)
+      p.ctrl->wg_done[9][wg] = wall_clock64();  // lists reset
+    // local expert lists: mark, prefix over the 128 local experts, then append
+    // the pairs with LDS atomics.
+    for (int pi = tid; pi < M * kTopK; pi += kThreads) {
       const int le = s_tid[pi] - p.expert_base;
-      if (le < 0 || le >= kLocalE) continue;
-      Fx* gp = p.gu + (size_t)pi * N13;
-      const half g16 = __float2half(gp[j]);
-      const half u16 = __float2half(gp[I + j]);
-      gp[j].v = 0;
-      gp[I + j].v = 0;
-      const half sg = __float2half(silu_f(__half2float(g16)));
-      p.act[(size_t)pi * I + j] = __float2half(__half2float(sg) * __half2float(u16));
+      if (le >= 0 && le < kLocalE) s_slot[le] = 0;
     }
-  }
-  {
-    const int I = p.I, K8 = I / 8, nchunk = H / 128;
-    auto pf = [&](int tt, uint32_t& sink, const volatile int* rel) {
-      for (int t = wg; t < nused * nchunk; t += G) {
-        const int u = t / nchunk, c = t % nchunk;
-        const uint32_t* wq = p.w2 + (size_t)s_used[u] * K8 * H + c * 128;
-        // 80 rows x 512 B: one 16-B unit per (row, 32-column slice)
-        for (int i = tt; i < K8 * 32; i += 224) {
-          if (*rel) return;
-          const uint4 v = *reinterpret_cast<const uint4*>(wq + (size_t)(i / 32) * H + (i % 32) * 4);
-          sink ^= v.x ^ v.w;
+    __syncthreads();
+    if (tid < kLocalE) {  // kLocalE = 128 = 4 waves
+      const bool used = s_slot[tid] == 0;
+      const unsigned long long b = __ballot(used);
+      const int rank = __popcll(b & ((1ull << lane) - 1ull));
+      if (lane == 0) s_red[wave] = __popcll(b);
+      __syncthreads_count(0);
+      int off = 0;
+      for (int w = 0; w < wave; w++) off += (int)s_red[w];
+      if (used) {
+        s_slot[tid] = off + rank;
+        s_used[off + rank] = tid;
+      }
+      if (tid == kLocalE - 1) s_nused = off + __popcll(b);
+    } else {
+      __syncthreads_count(0);
+    }
+    __syncthreads();
+    for (int pi = tid; pi < M * kTopK; pi += kThreads) {
+      const int le = s_tid[pi] - p.expert_base;
+      if (le >= 0 && le < kLocalE) {
+        const int u = s_slot[le];
+        const int r = atomicAdd(&s_ucnt[u], 1);
+        s_urow[u * kMaxM + r] = (short)pi;
+      }
+    }
+    __syncthreads();
+    const int nused = s_nused;
+    if (tid == 0 && wg < 256)
+      p.ctrl->wg_done[7][wg] = wall_clock64();  // P5a done
+    if (wg == 0) {
+      for (int i = tid; i < M * kTopK; i += kThreads)
+        p.ctrl->topk_id[i] = s_tid[i];
+      if (tid == 0) p.ctrl->pad[2] = nused;  // local experts touched (debug)
+    }
+
+    // ---------------- P5b: routed gate_up as WG tiles (today's moe_gemm_q4
+    // decomposition): (used expert, 1024 contiguous gate|up columns, K slice),
+    // activations of the expert's rows staged in LDS, fixed-point partial sums
+    // into p.gu; the K slice is chosen so the tiles fill the grid. Then the
+    // shared-expert down rows. P5c applies SwiGLU after one more barrier.
+    {
+      const int I = p.I, N13 = 2 * I, K8 = H / 8, g8 = p.group / 8;
+      {
+        constexpr int TN = kThreads * 4;
+        const int ntile = (N13 + TN - 1) / TN;
+        const int tb = nused * ntile;
+        const int kp = tiled_kslice(tb, K8, (kMaxM * 320) / (NR * 8) / 32 * 32,
+                                    G, MONO_FFN_P5T_OVH);
+        const int nk = (K8 + kp - 1) / kp;
+        for (int t = wg; t < tb * nk; t += G) {
+          const int sidx = t / tb, uc = t % tb;
+          const int u = uc / ntile, nt = uc % ntile;
+          const int e = s_used[u];
+          const int klo = sidx * kp, khi = min(K8, klo + kp);
+          tiled_q4<NR, UNR>(
+              p.w13 + (size_t)e * K8 * N13,
+              p.s13 + (size_t)e * (H / p.group) * N13,
+              p.z13 + (size_t)e * (H / p.group) * (N13 / 8), N13, g8,
+              p.zero_offset, nt * TN, klo, khi, s_ucnt[u],
+              [&](int r) {
+                return p.bin + (size_t)(s_urow[u * kMaxM + r] / kTopK) * H;
+              },
+              s_lora,
+              [&](int r, int col, const float (&a)[4]) {
+                Fx* dst = p.gu + (size_t)s_urow[u * kMaxM + r] * N13 + col;
+#pragma unroll
+                for (int q = 0; q < 4; q++) atomicAdd(dst + q, a[q]);
+              });
         }
       }
-    };
-    if (!grid_barrier(p, 5, &s_flag, pf)) return;
-  }
-  if (wg == 0 && tid == 0) p.ctrl->ts[5] = wall_clock64();
-
-  // ---------------- P6: routed down, same WG tiles over (used expert, 1024
-  // output columns, K slice); partials * top-k weight go to the fixed-point acc.
-  {
-    const int I = p.I, K8 = I / 8, g8 = p.group / 8;
-    {
-      constexpr int TN = kThreads * 4;
-      const int ntile = (H + TN - 1) / TN;
-      const int tb = nused * ntile;
-      const int kp = tiled_kslice(tb, K8, (kMaxM * 320) / (NR * 8) / 32 * 32, G,
-                                  MONO_FFN_P6T_OVH);
-      const int nk = (K8 + kp - 1) / kp;
-      for (int t = wg; t < tb * nk; t += G) {
-        const int sidx = t / tb, uc = t % tb;
-        const int u = uc / ntile, nt = uc % ntile;
-        const int e = s_used[u];
-        const int klo = sidx * kp, khi = min(K8, klo + kp);
-        tiled_q4<NR, UNR>(
-            p.w2 + (size_t)e * K8 * H, p.s2 + (size_t)e * (I / p.group) * H,
-            p.z2 + (size_t)e * (I / p.group) * (H / 8), H, g8, p.zero_offset,
-            nt * TN, klo, khi, s_ucnt[u],
-            [&](int r) { return p.act + (size_t)s_urow[u * kMaxM + r] * I; },
-            s_lora, [&](int r, int col, const float (&a)[4]) {
-              const int pi = s_urow[u * kMaxM + r];
-              const float tw = s_tw[pi];
-              Fx* dst = p.acc + (size_t)(pi / kTopK) * H + col;
+      for (int k = tid; k < M * p.Ise; k += kThreads) {
+        const int m = k / p.Ise, i2 = k % p.Ise;
+        s_seact[k] = __float2half(silu_f(p.se_g[m * 2 * p.Ise + i2]) *
+                                  p.se_g[m * 2 * p.Ise + p.Ise + i2]);
+      }
+      __syncthreads();
+      const int Ise8 = p.Ise / 8;
+      if constexpr (kRow) {
+        for (int h = gw; h < H; h += GW) {
+          for (int m0 = 0; m0 < M; m0 += MC) {
+            float a[MC];
 #pragma unroll
-              for (int q = 0; q < 4; q++) atomicAdd(dst + q, a[q] * tw);
-            });
+            for (int m = 0; m < MC; m++) a[m] = 0.f;
+            row_dot<MC>(p.se_w2 + (size_t)h * p.Ise, s_seact + m0 * p.Ise,
+                        p.Ise, M - m0, 0, Ise8, lane, a);
+            wave_sum<MC>(a);
+            if (lane == 0) {
+#pragma unroll
+              for (int m = 0; m < MC; m++)
+                if (m0 + m < M)
+                  p.acc[(size_t)(m0 + m) * H + h] =
+                      a[m] * sigmoid_f(p.se_gate[m0 + m]);
+            }
+          }
+        }
+      } else
+        for (int g = gw; g < H / 4; g += GW) {
+          const half* w[4];
+#pragma unroll
+          for (int r = 0; r < 4; r++)
+            w[r] = p.se_w2 + (size_t)(4 * g + r) * p.Ise;
+          for (int m0 = 0; m0 < M; m0 += 8) {
+            float acc[4][8];
+            zero48(acc);
+            rows4_dot(w, 4, s_seact, p.Ise, m0, M, 0, Ise8, lane, acc);
+            const float v = wave_transpose_sum(acc, lane);
+            const int r = lane / 8, m = m0 + lane % 8;
+            if (m < M)
+              p.acc[(size_t)m * H + 4 * g + r] = v * sigmoid_f(p.se_gate[m]);
+          }
+        }
+    }
+    {  // P5c: SwiGLU of the routed sums (reference rounding); consume and clear
+       // p.gu
+      if (!grid_barrier(p, 7, &s_flag)) return;
+      const int I = p.I, N13 = 2 * I;
+      for (int i = wg * kThreads + tid; i < M * kTopK * I; i += G * kThreads) {
+        const int pi = i / I, j = i % I;
+        const int le = s_tid[pi] - p.expert_base;
+        if (le < 0 || le >= kLocalE) continue;
+        Fx* gp = p.gu + (size_t)pi * N13;
+        const half g16 = __float2half(gp[j]);
+        const half u16 = __float2half(gp[I + j]);
+        gp[j].v = 0;
+        gp[I + j].v = 0;
+        const half sg = __float2half(silu_f(__half2float(g16)));
+        p.act[(size_t)pi * I + j] =
+            __float2half(__half2float(sg) * __half2float(u16));
       }
     }
-  }
-  if (!grid_barrier(p, 6, &s_flag)) return;
-  if (wg == 0 && tid == 0) p.ctrl->ts[6] = wall_clock64();
+    {
+      const int I = p.I, K8 = I / 8, nchunk = H / 128;
+      auto pf = [&](int tt, uint32_t& sink, const volatile int* rel) {
+        for (int t = wg; t < nused * nchunk; t += G) {
+          const int u = t / nchunk, c = t % nchunk;
+          const uint32_t* wq = p.w2 + (size_t)s_used[u] * K8 * H + c * 128;
+          // 80 rows x 512 B: one 16-B unit per (row, 32-column slice)
+          for (int i = tt; i < K8 * 32; i += 224) {
+            if (*rel) return;
+            const uint4 v = *reinterpret_cast<const uint4*>(
+                wq + (size_t)(i / 32) * H + (i % 32) * 4);
+            sink ^= v.x ^ v.w;
+          }
+        }
+      };
+      if (!grid_barrier(p, 5, &s_flag, pf)) return;
+    }
+    if (wg == 0 && tid == 0) p.ctrl->ts[5] = wall_clock64();
+
+    // ---------------- P6: routed down, same WG tiles over (used expert, 1024
+    // output columns, K slice); partials * top-k weight go to the fixed-point
+    // acc.
+    {
+      const int I = p.I, K8 = I / 8, g8 = p.group / 8;
+      {
+        constexpr int TN = kThreads * 4;
+        const int ntile = (H + TN - 1) / TN;
+        const int tb = nused * ntile;
+        const int kp = tiled_kslice(tb, K8, (kMaxM * 320) / (NR * 8) / 32 * 32,
+                                    G, MONO_FFN_P6T_OVH);
+        const int nk = (K8 + kp - 1) / kp;
+        for (int t = wg; t < tb * nk; t += G) {
+          const int sidx = t / tb, uc = t % tb;
+          const int u = uc / ntile, nt = uc % ntile;
+          const int e = s_used[u];
+          const int klo = sidx * kp, khi = min(K8, klo + kp);
+          tiled_q4<NR, UNR>(
+              p.w2 + (size_t)e * K8 * H, p.s2 + (size_t)e * (I / p.group) * H,
+              p.z2 + (size_t)e * (I / p.group) * (H / 8), H, g8, p.zero_offset,
+              nt * TN, klo, khi, s_ucnt[u],
+              [&](int r) { return p.act + (size_t)s_urow[u * kMaxM + r] * I; },
+              s_lora,
+              [&](int r, int col, const float (&a)[4]) {
+                const int pi = s_urow[u * kMaxM + r];
+                const float tw = s_tw[pi];
+                Fx* dst = p.acc + (size_t)(pi / kTopK) * H + col;
+#pragma unroll
+                for (int q = 0; q < 4; q++) atomicAdd(dst + q, a[q] * tw);
+              });
+        }
+      }
+    }
+    if (!grid_barrier(p, 6, &s_flag)) return;
+    if (wg == 0 && tid == 0) p.ctrl->ts[6] = wall_clock64();
 
   }  // FFN path
 
@@ -1605,8 +1706,9 @@ __global__ void __launch_bounds__(kThreads)
     // flag once the whole grid has pushed, wait for the peers' flags, sum the
     // slots in rank order (bitwise the same on every rank, like rdna_ar).
     const int W = p.ar.world, me = p.ar.rank;
-    const int seq =
-        __hip_atomic_load(p.ar.seqbuf, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) + 1;
+    const int seq = __hip_atomic_load(p.ar.seqbuf, __ATOMIC_ACQUIRE,
+                                      __HIP_MEMORY_SCOPE_AGENT) +
+                    1;
     const int par = seq & 1;
     const long long slot = p.ar.max_bytes / 2;
     for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads) {
@@ -1614,7 +1716,8 @@ __global__ void __launch_bounds__(kThreads)
       p.out[i] = h;
       for (int k = 1; k < W; k++) {
         const int j = (me + k) % W;
-        reinterpret_cast<half*>(p.ar.peers.stage[j])[((long long)par * W + me) * slot + i] = h;
+        reinterpret_cast<half*>(
+            p.ar.peers.stage[j])[((long long)par * W + me) * slot + i] = h;
       }
     }
     // one system fence per WG (like rdna_ar), not per thread: a per-thread
@@ -1624,7 +1727,8 @@ __global__ void __launch_bounds__(kThreads)
     if (!grid_barrier(p, 7, &s_flag)) return;
     __shared__ int s_ar_ok;
     if (wg == 0 && tid == 0) {
-      __hip_atomic_store(p.ar.seqbuf, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(p.ar.seqbuf, seq, __ATOMIC_RELEASE,
+                         __HIP_MEMORY_SCOPE_AGENT);
       for (int j = 0; j < W; j++)
         __hip_atomic_store(&p.ar.peers.flags[j][me], seq, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
@@ -1636,13 +1740,14 @@ __global__ void __launch_bounds__(kThreads)
       const unsigned long long t0 = wall_clock64();
       for (int j = 0; j < W && ok; j++) {
         if (j == me) continue;
-        while (__hip_atomic_load(&mine[j], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+        while (__hip_atomic_load(&mine[j], __ATOMIC_ACQUIRE,
+                                 __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
           __builtin_amdgcn_s_sleep(8);
           if (err_set(p.ctrl) || wall_clock64() - t0 > p.timeout_ticks) {
             int zero = 0;
-            if (__hip_atomic_compare_exchange_strong(&p.ctrl->err_code, &zero, 1,
-                                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED,
-                                                     __HIP_MEMORY_SCOPE_AGENT)) {
+            if (__hip_atomic_compare_exchange_strong(
+                    &p.ctrl->err_code, &zero, 1, __ATOMIC_RELAXED,
+                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
               p.ctrl->err_phase = 8;  // the fused all-reduce wait
               p.ctrl->err_wg = blockIdx.x;
             }
@@ -1654,7 +1759,8 @@ __global__ void __launch_bounds__(kThreads)
       s_ar_ok = ok;
     }
     __syncthreads();
-    if (wg == 0 && !s_ar_ok) return;  // sticky error set: the others leave the barrier
+    if (wg == 0 && !s_ar_ok)
+      return;  // sticky error set: the others leave the barrier
     if (!grid_barrier(p, 8, &s_flag)) return;
     const half* stage = reinterpret_cast<const half*>(p.ar.peers.stage[me]) +
                         (long long)par * W * slot;
@@ -1696,8 +1802,10 @@ __global__ void __launch_bounds__(kThreads)
         row[14] += emin - t0;
         row[15] += emax - t0;
       }
-      __hip_atomic_store(&sc[0], ~0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      __hip_atomic_store(&sc[1], 0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&sc[0], ~0ull, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&sc[1], 0ull, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
   }
 }
@@ -1707,7 +1815,8 @@ __global__ void __launch_bounds__(kThreads)
 // the previous region ended, 1: end) and the attention block (3: start,
 // 4: end of the attention-side HC preamble, 5: end after the attention
 // all-reduce) and around RowParallelLinear's all-reduce (6: start, 7: end).
-__global__ void mono_mark_kernel(unsigned long long* stats, int kind, int wtype) {
+__global__ void mono_mark_kernel(unsigned long long* stats, int kind,
+                                 int wtype) {
   const int width = wtype & 31, qsa = wtype >> 5;
   unsigned long long* sc = stats + kStatRows * kStatCols;
   unsigned long long* row = stats + width * kStatCols;
@@ -1758,7 +1867,7 @@ __global__ void mono_mark_kernel(unsigned long long* stats, int kind, int wtype)
 
 // Workspace size in bytes for M <= 24 (ctrl + scratch), 256-B aligned pieces.
 int64_t mono_k2_rdna2_workspace_bytes(int64_t H, int64_t R, int64_t ND,
-                                       int64_t E, int64_t Ise, int64_t I) {
+                                      int64_t E, int64_t Ise, int64_t I) {
   using namespace mono_ffn;
   auto al = [](int64_t b) { return (b + 255) / 256 * 256; };
   const int64_t M = kMaxM;
@@ -1807,8 +1916,9 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
                         const torch::Tensor* s2, const torch::Tensor* z2,
                         torch::Tensor& res_out, torch::Tensor& inj_out,
                         torch::Tensor& out, torch::Tensor& workspace,
-                        int64_t expert_base, int64_t zero_offset, int64_t num_wg,
-                        double eps, double timeout_ms, const GdnArgs* gdn = nullptr) {
+                        int64_t expert_base, int64_t zero_offset,
+                        int64_t num_wg, double eps, double timeout_ms,
+                        const GdnArgs* gdn = nullptr) {
   using namespace mono_ffn;
   const bool hc_only = wr == nullptr && gdn == nullptr;  // K1 only
   const int M = res.size(0);
@@ -1827,8 +1937,10 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
   const int group = !ffn ? 128 : H / s13->size(1);
   TORCH_CHECK(R == 320 || R <= 320, "mono_ffn: lora rank <= 320");
   if (ffn) {
-    TORCH_CHECK(E <= 512 && w13->size(0) <= kLocalE, "mono_ffn: E <= 512, local <= 128");
-    TORCH_CHECK(w13->size(2) == 2 * I && w13->size(1) * 8 == H, "mono_ffn: w13 shape");
+    TORCH_CHECK(E <= 512 && w13->size(0) <= kLocalE,
+                "mono_ffn: E <= 512, local <= 128");
+    TORCH_CHECK(w13->size(2) == 2 * I && w13->size(1) * 8 == H,
+                "mono_ffn: w13 shape");
     TORCH_CHECK(Ise <= 160 && Ise % 8 == 0, "mono_ffn: shared-expert size");
     TORCH_CHECK(H % 128 == 0 && I % 64 == 0 && group % 8 == 0,
                 "mono_ffn: alignment");
@@ -1862,30 +1974,39 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
     p.z2 = reinterpret_cast<const uint32_t*>(z2->data_ptr());
   }
   p.hc_only = hc_only ? 1 : 0;
-  TORCH_CHECK(gdn == nullptr || MONO_FFN_E1A, "mono_k2_rdna2_e1a: built without MONO_FFN_E1A");
+  TORCH_CHECK(gdn == nullptr || MONO_FFN_E1A,
+              "mono_k2_rdna2_e1a: built without MONO_FFN_E1A");
   if (gdn != nullptr) {
     using namespace mono_ffn;
     const auto& cs = *gdn->conv_state;
     const auto& ss = *gdn->ssm_state;
     TORCH_CHECK(H == 2560, "mono_gdn: hidden 2560");
     TORCH_CHECK(gdn->wq->size(0) == kGdnNQ && gdn->wq->size(1) == H &&
-                    gdn->wq->is_contiguous() && gdn->wq->scalar_type() == at::kHalf,
+                    gdn->wq->is_contiguous() &&
+                    gdn->wq->scalar_type() == at::kHalf,
                 "mono_gdn: in_proj_qkvz [4096, H] fp16");
     TORCH_CHECK(gdn->wba->size(0) == kGdnNB && gdn->wba->size(1) == H &&
-                    gdn->wba->is_contiguous(), "mono_gdn: in_proj_ba [24, H]");
-    TORCH_CHECK(gdn->convw->numel() == kGdnCD * 4 && gdn->convw->is_contiguous(),
-                "mono_gdn: conv weight [2560, 4]");
+                    gdn->wba->is_contiguous(),
+                "mono_gdn: in_proj_ba [24, H]");
+    TORCH_CHECK(
+        gdn->convw->numel() == kGdnCD * 4 && gdn->convw->is_contiguous(),
+        "mono_gdn: conv weight [2560, 4]");
     TORCH_CHECK(cs.dim() == 3 && cs.size(1) == kGdnCD && cs.size(2) == 3 &&
-                    cs.scalar_type() == at::kHalf, "mono_gdn: conv state (slots, 2560, 3) (non-spec decode)");
+                    cs.scalar_type() == at::kHalf,
+                "mono_gdn: conv state (slots, 2560, 3) (non-spec decode)");
     TORCH_CHECK(ss.dim() == 4 && ss.size(1) == kGdnHV && ss.size(2) == kGdnV &&
                     ss.size(3) == kGdnK && ss.scalar_type() == at::kFloat &&
                     ss.stride(3) == 1 && ss.stride(2) == kGdnK &&
-                    ss.stride(1) == kGdnV * kGdnK, "mono_gdn: ssm state [slots, 12, 128, 128] fp32");
-    TORCH_CHECK(gdn->alog->numel() == kGdnHV && gdn->alog->scalar_type() == at::kFloat &&
-                    gdn->dtb->numel() == kGdnHV && gdn->dtb->scalar_type() == at::kFloat,
+                    ss.stride(1) == kGdnV * kGdnK,
+                "mono_gdn: ssm state [slots, 12, 128, 128] fp32");
+    TORCH_CHECK(gdn->alog->numel() == kGdnHV &&
+                    gdn->alog->scalar_type() == at::kFloat &&
+                    gdn->dtb->numel() == kGdnHV &&
+                    gdn->dtb->scalar_type() == at::kFloat,
                 "mono_gdn: A_log / dt_bias fp32 [12]");
     TORCH_CHECK(gdn->wo->size(0) == H && gdn->wo->size(1) == kGdnVD &&
-                    gdn->wo->is_contiguous(), "mono_gdn: out_proj [H, 1536]");
+                    gdn->wo->is_contiguous(),
+                "mono_gdn: out_proj [H, 1536]");
     TORCH_CHECK(gdn->sidx->numel() >= M && gdn->sidx->scalar_type() == at::kInt,
                 "mono_gdn: state indices int32 [M]");
     p.gdn = 1;
@@ -1893,7 +2014,8 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
     p.g_wba = reinterpret_cast<const half*>(gdn->wba->data_ptr());
     p.g_convw = reinterpret_cast<const half*>(gdn->convw->data_ptr());
     p.g_convb = gdn->convb->numel() > 0
-                    ? reinterpret_cast<const half*>(gdn->convb->data_ptr()) : nullptr;
+                    ? reinterpret_cast<const half*>(gdn->convb->data_ptr())
+                    : nullptr;
     p.g_convs = reinterpret_cast<half*>(cs.data_ptr());
     p.g_cs_slot = cs.stride(0);
     p.g_cs_dim = cs.stride(1);
@@ -1911,7 +2033,11 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
     p.g_sig = (int)gdn->sigmoid;
   }
   int64_t off = 0;
-  auto take = [&](int64_t bytes) { char* q = base + off; off += al(bytes); return q; };
+  auto take = [&](int64_t bytes) {
+    char* q = base + off;
+    off += al(bytes);
+    return q;
+  };
   p.ctrl = reinterpret_cast<Ctrl*>(take(sizeof(Ctrl)));
   p.dai = reinterpret_cast<Fx*>(take((int64_t)kMaxM * ND * 8));
   p.acc = reinterpret_cast<Fx*>(take((int64_t)kMaxM * H * 8));
@@ -1925,28 +2051,41 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
   p.g_q = reinterpret_cast<Fx*>(take((int64_t)kMaxM * kGdnNI * 8));
   p.g_y = reinterpret_cast<half*>(take((int64_t)kMaxM * kGdnVD * 2));
   p.g_st = reinterpret_cast<half*>(take((int64_t)kMaxM * kGdnQK * 3 * 2));
-  if (hc_only) p.bin = reinterpret_cast<half*>(out.data_ptr());  // P3 writes the output
-  // GDN: P3's block_input stays in the scratch p.bin; out gets the out_proj partial
+  if (hc_only)
+    p.bin = reinterpret_cast<half*>(out.data_ptr());  // P3 writes the output
+  // GDN: P3's block_input stays in the scratch p.bin; out gets the out_proj
+  // partial
   {
     const int64_t need = mono_k2_rdna2_workspace_bytes(H, R, ND, E, Ise, I);
-    p.stats = workspace.numel() * workspace.element_size() >= need + kStatWords * 8
-                  ? reinterpret_cast<unsigned long long*>(base + need)
-                  : nullptr;
+    p.stats =
+        workspace.numel() * workspace.element_size() >= need + kStatWords * 8
+            ? reinterpret_cast<unsigned long long*>(base + need)
+            : nullptr;
   }
-  p.M = M; p.H = H; p.R = R; p.ND = ND; p.E = E; p.Ise = Ise; p.I = I;
-  p.group = group; p.expert_base = (int)expert_base;
-  p.zero_offset = (int)zero_offset; p.eps = (float)eps;
+  p.M = M;
+  p.H = H;
+  p.R = R;
+  p.ND = ND;
+  p.E = E;
+  p.Ise = Ise;
+  p.I = I;
+  p.group = group;
+  p.expert_base = (int)expert_base;
+  p.zero_offset = (int)zero_offset;
+  p.eps = (float)eps;
   {
     const char* pf = getenv("MONO_FFN_PREFETCH");
     p.prefetch = (pf && pf[0] == '1') ? 1 : 0;
   }
   if (ffn && gdn == nullptr) {
     const long long h = g_mono_ar_handle[res.get_device()];
-    if (h >= 0 && rdna_ar_device(h, &p.ar) && (long long)M * H * 2 <= p.ar.max_bytes)
+    if (h >= 0 && rdna_ar_device(h, &p.ar) &&
+        (long long)M * H * 2 <= p.ar.max_bytes)
       p.ar_on = 1;
   }
   int khz = 0;
-  hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, res.get_device());
+  hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
+                        res.get_device());
   p.timeout_ticks = (unsigned long long)(timeout_ms * (khz > 0 ? khz : 100000));
   auto stream = at::cuda::getCurrentCUDAStream();
   auto launch = [&](auto kern, int slot) {
@@ -1963,11 +2102,14 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
                             res.get_device());
       const int vgpr = std::max(8, (fa.numRegs + 7) / 8 * 8);
       const int by_waves = 2 * std::min(16, 1024 / vgpr) / kWaves;
-      const int by_lds = fa.sharedSizeBytes > 0 ? (int)(65536 / fa.sharedSizeBytes) : 8;
+      const int by_lds =
+          fa.sharedSizeBytes > 0 ? (int)(65536 / fa.sharedSizeBytes) : 8;
       cap[slot] = std::max(1, std::min(by_waves, by_lds) * 2 * units);
       if (getenv("MONO_FFN_VERBOSE"))
-        fprintf(stderr, "mono_ffn[%d]: numRegs=%d lds=%zu scratch=%zu -> cap %d WGs\n",
-                slot, fa.numRegs, fa.sharedSizeBytes, fa.localSizeBytes, cap[slot]);
+        fprintf(stderr,
+                "mono_ffn[%d]: numRegs=%d lds=%zu scratch=%zu -> cap %d WGs\n",
+                slot, fa.numRegs, fa.sharedSizeBytes, fa.localSizeBytes,
+                cap[slot]);
     }
     const int G = std::min(num_wg > 0 ? (int)num_wg : cap[slot], cap[slot]);
     hipLaunchKernelGGL(kern, dim3(G), dim3(kThreads), 0, stream, p);
@@ -1977,49 +2119,53 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
   else if (M <= 8)
     launch(mono_ffn_kernel<8, 8>, 1);
   else if (M <= 12)
-    launch(mono_ffn_kernel<12, MONO_FFN_TILED_BIG ? MONO_FFN_TILED_WPE : 8>, 2);
+    launch(mono_ffn_kernel < 12, MONO_FFN_TILED_BIG ? MONO_FFN_TILED_WPE : 8 >,
+           2);
   else
-    launch(mono_ffn_kernel<24, MONO_FFN_TILED_BIG ? MONO_FFN_TILED_WPE : 8>, 3);
+    launch(mono_ffn_kernel < 24, MONO_FFN_TILED_BIG ? MONO_FFN_TILED_WPE : 8 >,
+           3);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void mono_k2_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
-                    const torch::Tensor& inj, const torch::Tensor& norm_w,
-                    const torch::Tensor& wd, const torch::Tensor& wu,
-                    const torch::Tensor& wr, const torch::Tensor& se_w1,
-                    const torch::Tensor& se_w2, const torch::Tensor& se_wg,
-                    const torch::Tensor& w13, const torch::Tensor& s13,
-                    const torch::Tensor& z13, const torch::Tensor& w2,
-                    const torch::Tensor& s2, const torch::Tensor& z2,
-                    torch::Tensor& res_out, torch::Tensor& inj_out,
-                    torch::Tensor& out, torch::Tensor& workspace,
-                    int64_t expert_base, int64_t zero_offset, int64_t num_wg,
-                    double eps, double timeout_ms) {
-  mono_launch(res, blk, inj, norm_w, wd, wu, &wr, &se_w1, &se_w2, &se_wg, &w13, &s13,
-              &z13, &w2, &s2, &z2, res_out, inj_out, out, workspace, expert_base,
-              zero_offset, num_wg, eps, timeout_ms);
+                   const torch::Tensor& inj, const torch::Tensor& norm_w,
+                   const torch::Tensor& wd, const torch::Tensor& wu,
+                   const torch::Tensor& wr, const torch::Tensor& se_w1,
+                   const torch::Tensor& se_w2, const torch::Tensor& se_wg,
+                   const torch::Tensor& w13, const torch::Tensor& s13,
+                   const torch::Tensor& z13, const torch::Tensor& w2,
+                   const torch::Tensor& s2, const torch::Tensor& z2,
+                   torch::Tensor& res_out, torch::Tensor& inj_out,
+                   torch::Tensor& out, torch::Tensor& workspace,
+                   int64_t expert_base, int64_t zero_offset, int64_t num_wg,
+                   double eps, double timeout_ms) {
+  mono_launch(res, blk, inj, norm_w, wd, wu, &wr, &se_w1, &se_w2, &se_wg, &w13,
+              &s13, &z13, &w2, &s2, &z2, res_out, inj_out, out, workspace,
+              expert_base, zero_offset, num_wg, eps, timeout_ms);
 }
 
 // E1: K1 + the GDN (linear-attention) decode of one layer in one launch.
 // out = out_proj partial [M, H] (pre all-reduce); conv / ssm state updated in
 // place for the rows' slots (null slots <= 0 untouched, output zero).
 void mono_k2_rdna2_e1a(const torch::Tensor& res, const torch::Tensor& blk,
-                    const torch::Tensor& inj, const torch::Tensor& norm_w,
-                    const torch::Tensor& wd, const torch::Tensor& wu,
-                    const torch::Tensor& wq, const torch::Tensor& wba,
-                    const torch::Tensor& convw, const torch::Tensor& convb,
-                    torch::Tensor& conv_state, torch::Tensor& ssm_state,
-                    const torch::Tensor& alog, const torch::Tensor& dtb,
-                    const torch::Tensor& gnorm_w, const torch::Tensor& wo,
-                    const torch::Tensor& sidx, torch::Tensor& res_out,
-                    torch::Tensor& inj_out, torch::Tensor& out, torch::Tensor& workspace,
-                    int64_t num_wg, double eps, double gn_eps, int64_t gn_sigmoid,
-                    double scale, double timeout_ms) {
-  GdnArgs g{&wq, &wba, &convw, &convb, &gnorm_w, &wo, &sidx, &conv_state, &ssm_state,
-            &alog, &dtb, scale, gn_eps, gn_sigmoid};
+                       const torch::Tensor& inj, const torch::Tensor& norm_w,
+                       const torch::Tensor& wd, const torch::Tensor& wu,
+                       const torch::Tensor& wq, const torch::Tensor& wba,
+                       const torch::Tensor& convw, const torch::Tensor& convb,
+                       torch::Tensor& conv_state, torch::Tensor& ssm_state,
+                       const torch::Tensor& alog, const torch::Tensor& dtb,
+                       const torch::Tensor& gnorm_w, const torch::Tensor& wo,
+                       const torch::Tensor& sidx, torch::Tensor& res_out,
+                       torch::Tensor& inj_out, torch::Tensor& out,
+                       torch::Tensor& workspace, int64_t num_wg, double eps,
+                       double gn_eps, int64_t gn_sigmoid, double scale,
+                       double timeout_ms) {
+  GdnArgs g{&wq,  &wba,  &convw,      &convb,     &gnorm_w,
+            &wo,  &sidx, &conv_state, &ssm_state, &alog,
+            &dtb, scale, gn_eps,      gn_sigmoid};
   mono_launch(res, blk, inj, norm_w, wd, wu, nullptr, nullptr, nullptr, nullptr,
-              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out, inj_out,
-              out, workspace, 0, 1, num_wg, eps, timeout_ms, &g);
+              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out,
+              inj_out, out, workspace, 0, 1, num_wg, eps, timeout_ms, &g);
 }
 
 // K1: the attention-side HC preamble (combine + grouped norm + down/up mix)
@@ -2031,22 +2177,25 @@ void mono_k1_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    torch::Tensor& out, torch::Tensor& workspace, int64_t num_wg,
                    double eps, double timeout_ms) {
   mono_launch(res, blk, inj, norm_w, wd, wu, nullptr, nullptr, nullptr, nullptr,
-              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out, inj_out,
-              out, workspace, 0, 1, num_wg, eps, timeout_ms);
+              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out,
+              inj_out, out, workspace, 0, 1, num_wg, eps, timeout_ms);
 }
 
 // Sticky error record of a workspace: [code, phase, wg] (int32, CPU tensor).
 // WG0 phase timestamps of the last launch (wall-clock ticks, 100 MHz on V620).
 torch::Tensor mono_k2_rdna2_phase_ts(const torch::Tensor& workspace) {
   // ts[8] then wg_done[10][256]
-  return workspace.slice(0, 32, 32 + 8 * (8 + 10 * 256)).view(torch::kInt64).to(torch::kCPU);
+  return workspace.slice(0, 32, 32 + 8 * (8 + 10 * 256))
+      .view(torch::kInt64)
+      .to(torch::kCPU);
 }
 
 // Top-k expert ids [M * 10] chosen by the last launch (debug / tests).
 torch::Tensor mono_k2_rdna2_topk(const torch::Tensor& workspace) {
   const int64_t off = offsetof(mono_ffn::Ctrl, topk_id);
   return workspace.slice(0, off, off + 4 * mono_ffn::kMaxPairs)
-      .view(torch::kInt32).to(torch::kCPU);
+      .view(torch::kInt32)
+      .to(torch::kCPU);
 }
 
 void mono_k2_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width) {
@@ -2072,25 +2221,29 @@ torch::Tensor mono_k2_rdna2_workspace_alloc(int64_t nbytes, int64_t device) {
   TORCH_CHECK(nbytes > 0, "mono_ffn: workspace size");
   const at::cuda::CUDAGuard guard((c10::DeviceIndex)device);
   void* ptr = nullptr;
-  TORCH_CHECK(hipExtMallocWithFlags(&ptr, (size_t)nbytes, hipDeviceMallocDefault) ==
-                  hipSuccess,
+  TORCH_CHECK(hipExtMallocWithFlags(&ptr, (size_t)nbytes,
+                                    hipDeviceMallocDefault) == hipSuccess,
               "mono_ffn: hipExtMallocWithFlags failed");
-  TORCH_CHECK(hipMemset(ptr, 0, (size_t)nbytes) == hipSuccess, "mono_ffn: memset");
+  TORCH_CHECK(hipMemset(ptr, 0, (size_t)nbytes) == hipSuccess,
+              "mono_ffn: memset");
   TORCH_CHECK(hipDeviceSynchronize() == hipSuccess, "mono_ffn: sync");
-  auto opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, device);
+  auto opts =
+      torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, device);
   return torch::from_blob(ptr, {nbytes}, [](void*) {}, opts);  // never freed
 }
 
 // HSA global flags of a tensor's allocation (2 = fine-grained, 4 = coarse-
 // grained, 8 = extended-scope fine-grained), -1 if unavailable.
 int64_t mono_k2_rdna2_mem_flags(const torch::Tensor& t) {
-  using fn_t = hsa_status_t (*)(const void*, hsa_amd_pointer_info_t*, void* (*)(size_t),
-                                uint32_t*, hsa_agent_t**);
-  static fn_t fn = reinterpret_cast<fn_t>(dlsym(RTLD_DEFAULT, "hsa_amd_pointer_info"));
+  using fn_t = hsa_status_t (*)(const void*, hsa_amd_pointer_info_t*,
+                                void* (*)(size_t), uint32_t*, hsa_agent_t**);
+  static fn_t fn =
+      reinterpret_cast<fn_t>(dlsym(RTLD_DEFAULT, "hsa_amd_pointer_info"));
   if (fn == nullptr) return -1;
   hsa_amd_pointer_info_t info{};
   info.size = sizeof(info);
-  if (fn(t.data_ptr(), &info, nullptr, nullptr, nullptr) != HSA_STATUS_SUCCESS) return -1;
+  if (fn(t.data_ptr(), &info, nullptr, nullptr, nullptr) != HSA_STATUS_SUCCESS)
+    return -1;
   return (int64_t)info.global_flags;
 }
 

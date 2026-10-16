@@ -89,7 +89,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "mono_k2_rdna2_workspace_bytes(int H, int R, int ND, int E, int Ise, "
       "int I) -> int");
-  rocm_ops.impl("mono_k2_rdna2_workspace_bytes", &mono_k2_rdna2_workspace_bytes);
+  rocm_ops.impl("mono_k2_rdna2_workspace_bytes",
+                &mono_k2_rdna2_workspace_bytes);
   rocm_ops.def(
       "mono_k2_rdna2(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, "
       "Tensor wd, Tensor wu, Tensor wr, Tensor se_w1, Tensor se_w2, "
@@ -102,21 +103,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("mono_k2_rdna2_error", torch::kCUDA, &mono_k2_rdna2_error);
   rocm_ops.def("mono_k2_rdna2_mark(Tensor! stats, int kind, int width) -> ()");
   rocm_ops.impl("mono_k2_rdna2_mark", torch::kCUDA, &mono_k2_rdna2_mark);
-  rocm_ops.def("mono_k2_rdna2_workspace_alloc(int nbytes, int device) -> Tensor");
-  rocm_ops.impl("mono_k2_rdna2_workspace_alloc", &mono_k2_rdna2_workspace_alloc);
+  rocm_ops.def(
+      "mono_k2_rdna2_workspace_alloc(int nbytes, int device) -> Tensor");
+  rocm_ops.impl("mono_k2_rdna2_workspace_alloc",
+                &mono_k2_rdna2_workspace_alloc);
   rocm_ops.def("mono_k2_rdna2_mem_flags(Tensor t) -> int");
   rocm_ops.impl("mono_k2_rdna2_mem_flags", &mono_k2_rdna2_mem_flags);
   rocm_ops.def("mono_k2_rdna2_set_ar(int handle, int device) -> int");
   rocm_ops.impl("mono_k2_rdna2_set_ar", &mono_k2_rdna2_set_ar);
   rocm_ops.def(
-      "mono_k1_rdna2(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, Tensor wd, "
-      "Tensor wu, Tensor! res_out, Tensor! inj_out, Tensor! out, Tensor! workspace, "
+      "mono_k1_rdna2(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, Tensor "
+      "wd, "
+      "Tensor wu, Tensor! res_out, Tensor! inj_out, Tensor! out, Tensor! "
+      "workspace, "
       "int num_wg, float eps, float timeout_ms) -> ()");
   rocm_ops.impl("mono_k1_rdna2", torch::kCUDA, &mono_k1_rdna2);
   rocm_ops.def(
-      "mono_k2_rdna2_e1a(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, Tensor wd, "
+      "mono_k2_rdna2_e1a(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, "
+      "Tensor wd, "
       "Tensor wu, Tensor wq, Tensor wba, Tensor convw, Tensor convb, "
-      "Tensor! conv_state, Tensor! ssm_state, Tensor alog, Tensor dtb, Tensor gnorm_w, "
+      "Tensor! conv_state, Tensor! ssm_state, Tensor alog, Tensor dtb, Tensor "
+      "gnorm_w, "
       "Tensor wo, Tensor sidx, Tensor! res_out, Tensor! inj_out, Tensor! out, "
       "Tensor! workspace, int num_wg, float eps, float gn_eps, int gn_sigmoid, "
       "float scale, float timeout_ms) -> ()");
@@ -131,13 +138,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("mono_gdn_rdna2_scratch_bytes(int M, int HV, int H) -> int");
   rocm_ops.impl("mono_gdn_rdna2_scratch_bytes", &mono_gdn_rdna2_scratch_bytes);
   rocm_ops.def(
-      "mono_qsa_decode_rdna2(Tensor q, Tensor k_cache, Tensor v_cache, Tensor indices, "
+      "mono_qsa_decode_rdna2(Tensor q, Tensor k_cache, Tensor v_cache, Tensor "
+      "indices, "
       "Tensor block_table, Tensor token_to_req, Tensor! out, Tensor! scratch, "
       "Tensor! counters, int splits) -> ()");
   rocm_ops.impl("mono_qsa_decode_rdna2", torch::kCUDA, &mono_qsa_decode_rdna2);
   rocm_ops.def("mono_qsa_decode_rdna2_splits(int M, int KVH, int W) -> int");
   rocm_ops.impl("mono_qsa_decode_rdna2_splits", &mono_qsa_decode_rdna2_splits);
-#endif
+  #endif
   rocm_ops.def(
       "rdna_se_gate_up_silu(Tensor x, Tensor w, Tensor? scale) -> Tensor");
   rocm_ops.impl("rdna_se_gate_up_silu", torch::kCUDA, &rdna_se_gate_up_silu);
