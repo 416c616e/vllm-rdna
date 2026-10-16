@@ -514,42 +514,7 @@ int compute_split_k(int size_m, int size_n, int size_k) {
   return result;
 }
 
-// Public dispatcher entry: pick a Config, compute split_k, launch.
-// K-aware config selection. Mirrors the empirical 4-branch rule from the
-// 3264-cell microbench (M=1..32, K<4096, N=128..16384): ConfigV1 is the safe
-// default; ConfigC wins at M=4..8 with high N and K, and at M=12 with mid N
-// and any K>=512; ConfigA wins at small M (M<4) with large N. The envelope
-// guard (M<=32 AND K<4096) is enforced by the outer dispatcher
-// (_rdna2_w4a16_select_kernel) so this function never sees out-of-envelope
-// cells; the V1 default covers anything outside the explicit K-gated
-// branches.
-// K-aware config selection. Three tiers:
-//
-//   - Small M (M <= 32): original 3264-cell microbench. ConfigV1 is the
-//     safe default; ConfigC wins at M=4..8 with high N and K, and at
-//     M=12/32 in narrow N windows; ConfigA wins at small M (M<4) with
-//     large N.
-//
-//   - Large M (M > 256): empirical data from 2026-09-10 profile run on
-//     Qwen3.8-27B-AWQ-INT4 (gfx1030, TP=2). ConfigV1 (M_TILE=8) is at
-//     53% of peak fp16 for M=1856-2048. ConfigA (M_TILE=16) halves the
-//     M-blocks and reduces atomic contention per output tile from 16
-//     blocks/tile (split_k=16 with M_TILE=8) to 8 blocks/tile (split_k=8
-//     with M_TILE=16). ConfigC (N_TILE=512) is for small-N tiles where
-//     ConfigA's N_TILE=1024 would over-shard the grid.
-//
-//   - Envelope guard: the outer dispatcher (rdna2_w4a16.py) routes
-//     AWQ/GPTQ prefill to this function only when M > 32. ConfigA is
-//     the right choice for Qwen3.8-27B-AWQ high-N shapes (intermediate
-//     projection per-rank N=8704, down-projection per-rank N=2560).
 inline int select_config(int size_m, int size_n, int size_k) {
-  // Debug override: force a specific config for kernel-level bisection.
-  static const int force_config = []() {
-    const char* e = std::getenv("VLLM_RDNA2_PREFILL_FORCE_CONFIG");
-    return e ? std::atoi(e) : -1;
-  }();
-  if (force_config >= 0) return force_config;
-
   // Large-M prefill: prefer ConfigA (M_TILE=16, N_TILE=1024) for high N.
   // ConfigC (M_TILE=16, N_TILE=512) for small N. ConfigV1 (M_TILE=8)
   // would need 2x more M-blocks per output tile and 2x more atomic
@@ -569,18 +534,6 @@ inline int select_config(int size_m, int size_n, int size_k) {
   return ConfigId_V1;
 }
 
-// Debug override: force split_k for isolating the atomic-epilogue cost.
-// split_k divides size_k; the last split absorbs any remainder. The caller
-// must ensure the forced split_k keeps k_per_split within the LDS budget —
-// this knob is for experiments, not production.
-inline int maybe_force_split_k(int computed) {
-  static const int force = []() {
-    const char* e = std::getenv("VLLM_RDNA2_PREFILL_FORCE_SPLIT_K");
-    return e ? std::atoi(e) : -1;
-  }();
-  return force > 0 ? force : computed;
-}
-
 void launch_dispatch(const half* a, const uint32_t* b_q_weight,
                      const uint32_t* b_qzeros, const half* b_scales,
                      const int* b_q_perm, half* c, int size_m, int size_n,
@@ -588,16 +541,14 @@ void launch_dispatch(const half* a, const uint32_t* b_q_weight,
                      cudaStream_t stream) {
   switch (select_config(size_m, size_n, size_k)) {
     case ConfigId_V1: {
-      const int split_k = maybe_force_split_k(
-          compute_split_k<ConfigV1>(size_m, size_n, size_k));
+      const int split_k = compute_split_k<ConfigV1>(size_m, size_n, size_k);
       launch_for_config<ConfigV1>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
                                   c, size_m, size_n, size_k, groups, split_k,
                                   use_v2_format, stream);
       break;
     }
     case ConfigId_C: {
-      const int split_k =
-          maybe_force_split_k(compute_split_k<ConfigC>(size_m, size_n, size_k));
+      const int split_k = compute_split_k<ConfigC>(size_m, size_n, size_k);
       launch_for_config<ConfigC>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
                                  size_m, size_n, size_k, groups, split_k,
                                  use_v2_format, stream);
@@ -605,8 +556,7 @@ void launch_dispatch(const half* a, const uint32_t* b_q_weight,
     }
     case ConfigId_A:
     default: {
-      const int split_k =
-          maybe_force_split_k(compute_split_k<ConfigA>(size_m, size_n, size_k));
+      const int split_k = compute_split_k<ConfigA>(size_m, size_n, size_k);
       launch_for_config<ConfigA>(a, b_q_weight, b_qzeros, b_scales, b_q_perm, c,
                                  size_m, size_n, size_k, groups, split_k,
                                  use_v2_format, stream);
@@ -623,9 +573,7 @@ void launch_dispatch(const half* a, const uint32_t* b_q_weight,
 //
 // `gptq_gemm_rdna2_prefill` is the canonical name going forward.  It calls
 // the K-aware `select_config(M, K, N)` to pick V1 / A / C internally; the
-// Python dispatcher does not need to know about configs.  An ABI shim with
-// the old `..._prefill_direct` name is kept at the bottom of the file so
-// existing Python callers continue to link without modification.
+// Python dispatcher does not need to know about configs.
 // ---------------------------------------------------------------------------
 torch::Tensor gptq_gemm_rdna2_prefill(torch::Tensor a, torch::Tensor b_q_weight,
                                       torch::Tensor b_qzeros,
@@ -671,20 +619,4 @@ torch::Tensor gptq_gemm_rdna2_prefill(torch::Tensor a, torch::Tensor b_q_weight,
       use_v2_format, stream.stream());
 
   return c;
-}
-
-// ---------------------------------------------------------------------------
-// ABI-compat shim.
-//
-// Same signature and behaviour as the original v1 public entry.  Kept so
-// existing Python callers (RDNA2W4A16LinearKernel.apply_weights in
-// rdna2_w4a16.py) that call `ops.gptq_gemm_rdna2_prefill_direct(...)` keep
-// working without a Python change.  New code should use
-// `ops.gptq_gemm_rdna2_prefill` directly.
-// ---------------------------------------------------------------------------
-torch::Tensor gptq_gemm_rdna2_prefill_direct(
-    torch::Tensor a, torch::Tensor b_q_weight, torch::Tensor b_qzeros,
-    torch::Tensor b_scales, torch::Tensor b_g_idx, bool use_v2_format) {
-  return gptq_gemm_rdna2_prefill(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
-                                 use_v2_format);
 }
