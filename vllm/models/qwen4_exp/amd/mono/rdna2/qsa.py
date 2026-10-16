@@ -18,12 +18,29 @@
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from ...ops import qsa_rdna2
 
+logger = init_logger(__name__)
+
 MIN_ROWS = 3  # HIP (plain-load merge) wins from 3 rows at long context
 _COUNTERS: dict[int, torch.Tensor] = {}
+_LOGGED: set = set()
+
+
+def _log_once(what: str, rows: int, taken: bool) -> None:
+    """One line per (part, decode width); one for every wider batch."""
+    key = (what, rows if rows <= 64 else -1, taken)
+    if key not in _LOGGED:
+        _LOGGED.add(key)
+        logger.info(
+            "mono qsa_rdna2: %s %s -> %s",
+            what,
+            f"{rows} rows" if rows <= 64 else "> 64 rows",
+            "mono" if taken else "today's",
+        )
 
 
 def _hip_ok(q, k_cache, v_cache, group_size) -> bool:
@@ -48,7 +65,9 @@ def sparse_decode(
     """One-launch HIP sparse decode attention into ``out``; False (nothing
     done) when the batch is not one the kernel covers."""
     if not _hip_ok(q, k_cache, v_cache, group_size):
+        _log_once("sparse decode", q.shape[0], False)
         return False
+    _log_once("sparse decode", q.shape[0], True)
     dev = q.device.index if q.device.index is not None else torch.cuda.current_device()
     counters = _COUNTERS.get(dev)
     if counters is None:  # QSA runs as an eager break: never allocated under capture
@@ -123,6 +142,7 @@ def norm_rope(
         mrope_section=mrope_section if positions.ndim == 2 else None,
         norm_beta=1.0,  # GemmaRMSNorm scales by (1 + w)
     )
+    _log_once(f"norm+rope ({num_heads} heads)", num_tokens, True)
     return out.view(num_tokens, num_heads, head_dim)
 
 
@@ -284,4 +304,5 @@ def store_rows3(
         P_BLOCK=triton.next_power_of_2(p_cache.shape[3]),
         num_warps=4,
     )
+    _log_once("indexer store", n, True)
     return True
