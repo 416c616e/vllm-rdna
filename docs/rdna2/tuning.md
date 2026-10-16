@@ -205,9 +205,6 @@ path (correctness A/B only).
 - `VLLM_HIPPIHX`, `_LIB`, `_CODE_OBJECT`: route ops through a prebuilt hippihx
   V1 library when its plan is ready.
 - `VLLM_NO_PARTIAL_HASH=1`: disable partial-block prefix hits (debugging).
-- Recipes still set `VLLM_ROCM_MOE_PREFILL`, `VLLM_ROCM_SKIP_LIVE_TAIL_HASH`
-  and `VLLM_RDNA_FORCE_FP16`. Nothing in this tree reads them. Use
-  `--dtype float16` (the launcher does) for FP16.
 
 ### Diagnostics (off by default; slow, do not bench with them)
 
