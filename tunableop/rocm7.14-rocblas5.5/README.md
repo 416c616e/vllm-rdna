@@ -108,9 +108,10 @@ It auto-selects profile `rocm7.14-rocblas5.5` from the loaded rocBLAS build
 (matching `lib_sha256`) and sets a **lookup-only** environment
 (`PYTORCH_TUNABLEOP_ENABLED=1`, `TUNING=0`, `PYTORCH_TUNABLEOP_FILENAME` at the
 rank files). The launchers
-(`scripts/serve_gfx1030_flashnext_mtp.sh`, `scripts/serve_gfx1030_27b_dense.sh`,
-`scripts/serve_gfx1030_flashnext.sh`, `scripts/serve_gfx1030_full.sh`) already
-do this. A healthy start logs:
+(`tools/rdna/serve_gfx1030_flashnext_mtp.sh`,
+`tools/rdna/serve_gfx1030_27b_dense.sh`,
+`tools/rdna/serve_gfx1030_flashnext.sh`, `tools/rdna/serve_gfx1030_full.sh`)
+already do this. A healthy start logs:
 
 ```
 TunableOp profile rocm7.14-rocblas5.5 auto-selected for rocBLAS build f30bb442e9b5.

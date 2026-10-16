@@ -9,12 +9,12 @@ scheduler or the kernels. Use it to A/B fix rounds.
 Earlier work on the same symptom: `prefill-cadence-2026-09-28.md`,
 `prefill-decode-interference-2026-09-27.md` and
 `mixed-batch-and-prefill-investigation-2026-10-05.md` in the parent repo.
-Those used `tools/rdna2_028/prefill_decode_probe.py` (one decoder plus one
-16k injection: 9 decoder tokens during a 9.6 s prefill, ITL p50 1.5 s) and
-`bench_results/2026-10-05_mixedbatch-validation/mixed_probe.py` (7 decoders
-plus one 16k prompt, which proved that mixed steps happen:
-`Running: 8, Waiting: 0`). This probe generalizes their inject scenario.
-It runs N decoders, several lengths, periodic and reverse cases and repeats,
+One of those runs was one decoder plus one 16k injection (9 decoder tokens
+during a 9.6 s prefill, ITL p50 1.5 s). Another was 7 decoders plus one 16k
+prompt, which proved that mixed steps happen (`Running: 8, Waiting: 0`).
+The driver scripts from that work are not in this tree. This probe generalizes
+their inject scenario. It runs N decoders, several lengths, periodic and
+reverse cases and repeats,
 uses token-exact prompts, adds gates and attributes each window to scheduler
 steps. Fork knobs that move it (all still on v0.31):
 
