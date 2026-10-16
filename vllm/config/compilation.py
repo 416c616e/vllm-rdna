@@ -775,6 +775,8 @@ class CompilationConfig:
         "vllm::linear_attention",
         "vllm::qwen_gdn_attention_core",
         "vllm::qwen_gdn_attention_core_fused_norm_packed",
+        # Qwen4Exp RDNA2 MonoKernel GDN part: same split point as the GDN core
+        "vllm::qwen4_exp_mono_gdn_rdna2",
         "vllm::qwen_gdn_full_forward",
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",

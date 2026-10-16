@@ -21,6 +21,9 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 # kernel stays on Triton (prefill-only, large M).
 from . import qsa_rdna2
 
+# Qwen4Exp RDNA2 MonoKernel QSA part (--monokernel): the module
+# vllm/models/qwen4_exp/amd/mono/rdna2/qsa.py once installed, else None.
+MONO_QSA = None
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
@@ -56,6 +59,7 @@ def _qsa_mqa_paged_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    EARLY_EXIT: tl.constexpr = 0,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -74,6 +78,12 @@ def _qsa_mqa_paged_kernel(
     )
     if tl.program_id(1) == 0:
         tl.store(visible_blocks_ptr + row, visible)
+    if EARLY_EXIT:  # noqa: SIM102  (constexpr gate, Triton)
+        # E3: the decode top-k reads columns [0, visible) only, so tiles past
+        # the live context neither score nor store (valid inside CUDA graphs,
+        # where the host column bound is the capture-time worst case)
+        if tl.program_id(1) * BLOCK_N >= visible:
+            return
     logical_page = columns // PAGE_SIZE
     page_offset = columns % PAGE_SIZE
     valid = (
@@ -229,6 +239,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NOT_SKIP: tl.constexpr = 1,  # 0 = skip all-padding tiles (E3)
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -264,59 +275,66 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=columns < TOPK,
             other=-1,
         )
-        safe_token = tl.maximum(logical_token, 0)
-        logical_page = safe_token // PAGE_SIZE
-        page_offset = safe_token % PAGE_SIZE
-        valid = (
-            (request >= 0)
-            & (request < num_requests)
-            & (logical_token >= 0)
-            & (logical_page < PAGE_TABLE_WIDTH)
-        )
-        physical_page = tl.load(
-            block_table_ptr
-            + safe_request * stride_table_req
-            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-            mask=valid,
-            other=-1,
-        )
-        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
-        # physical_page * block stride can overflow int32 for large caches.
-        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
-        scores = tl.where(valid[None, :], scores, -1.0e20)
-        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.where(
-            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
-        )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
-        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
-        max_value = next_max
+        # E3: all-padding tiles (the selection is a valid prefix + -1s)
+        # contribute nothing; skip their K/V loads and dots
+        if NOT_SKIP:  # noqa: SIM108  (constexpr gate, Triton)
+            live = True  # compile-time: today's kernel unchanged
+        else:
+            live = tl.max(logical_token, axis=0) >= 0
+        if live:
+            safe_token = tl.maximum(logical_token, 0)
+            logical_page = safe_token // PAGE_SIZE
+            page_offset = safe_token % PAGE_SIZE
+            valid = (
+                (request >= 0)
+                & (request < num_requests)
+                & (logical_token >= 0)
+                & (logical_page < PAGE_TABLE_WIDTH)
+            )
+            physical_page = tl.load(
+                block_table_ptr
+                + safe_request * stride_table_req
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=valid,
+                other=-1,
+            )
+            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+            # physical_page * block stride can overflow int32 for large caches.
+            safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            scores = tl.dot(query, keys)
+            # Scaling scores avoids re-quantizing a scaled query to BF16.
+            scores *= softmax_scale_log2
+            scores = tl.where(valid[None, :], scores, -1.0e20)
+            next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+            alpha = tl.math.exp2(max_value - next_max)
+            probabilities = tl.where(
+                valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+            )
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
+            normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+            max_value = next_max
 
     has_values = normalizer > 0
     normalized_output = tl.where(
@@ -711,6 +729,7 @@ def qsa_mqa_paged(
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
         COMPRESS_RATIO=compress_ratio,
+        EARLY_EXIT=1 if MONO_QSA and not current_platform.is_cuda() else 0,
         num_warps=_QSA_MQA_WARPS,
         **_qsa_mqa_extra,
     )
@@ -924,6 +943,10 @@ def qsa_sparse_paged_attention(
         return out
 
     group_size = q.shape[1] // k_cache.shape[2]
+    if MONO_QSA and MONO_QSA.sparse_decode(
+        q, k_cache, v_cache, group_size, logical_indices, block_table, token_to_req, out
+    ):
+        return out
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
@@ -1007,6 +1030,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        NOT_SKIP=0 if MONO_QSA else 1,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

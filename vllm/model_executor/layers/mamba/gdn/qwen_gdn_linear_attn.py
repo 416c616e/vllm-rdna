@@ -95,6 +95,11 @@ if GDN_AITER_TRITON_AVAILABLE:
 
 logger = init_logger(__name__)
 
+# Set by a model MonoKernel (--monokernel; Qwen4Exp RDNA2:
+# vllm/models/qwen4_exp/amd/mono/rdna2/gdn.py) before its layers are built:
+# hook(layer, vllm_config) -> (decode-core custom op, per-layer state) or None.
+MONO_GDN_HOOK: Any = None
+
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
@@ -639,6 +644,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if mode is not None and bool(mode) and on_rdna_family():
             self._init_gdn_state_arenas()
 
+        mono = MONO_GDN_HOOK(self, vllm_config) if MONO_GDN_HOOK else None
+        self._mono_gdn_op, self._mono_gdn = mono if mono else (None, None)
+
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -1162,6 +1170,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 layer_name=_encode_layer_name(self.prefix),
             )
             output, _ = self.out_proj(core_attn_out.flatten(-2))
+            return output
+
+        if self._mono_gdn_op is not None:  # MonoKernel decode core -> out_proj input
+            y = hidden_states.new_empty((num_tokens, self.value_dim // self.tp_size))
+            self._mono_gdn_op(
+                mixed_qkvz, ba, y, layer_name=_encode_layer_name(self.prefix)
+            )
+            output, _ = self.out_proj(y)
             return output
 
         if self.gqa_interleaved_layout:

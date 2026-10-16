@@ -66,6 +66,19 @@ RdnaArState& inst(int64_t h) {
 }
 }  // namespace
 
+bool rdna_ar_device(long long handle, RdnaArDev* out) {
+  if (handle < 0 || handle >= g_ninst) return false;
+  const RdnaArState& g = g_inst[handle];
+  if (!g.ready || g.world < 2) return false;
+  out->peers = g.peers;
+  out->seqbuf = g.seqbuf;
+  out->max_bytes = g.max_bytes;
+  out->rank = g.rank;
+  out->world = g.world;
+  out->ready = 1;
+  return true;
+}
+
 // Returns [handle (int64), 64 bytes of IPC handle] packed in a uint8 tensor of
 // 72 bytes.
 at::Tensor rdna_ar_init(int64_t rank, int64_t world,

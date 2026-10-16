@@ -67,6 +67,7 @@ def test_qsa_prefill_bounds_scoring_to_live_context(
         compressed_key_cache=SimpleNamespace(kv_cache=cache),
         token_topk=2048,
         compress_ratio=4,
+        _mono_qsa=None,  # --monokernel off
     )
     metadata = SimpleNamespace(
         block_table=table,

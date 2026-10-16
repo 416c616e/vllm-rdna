@@ -170,7 +170,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
         num_tokens = attn_metadata.num_actual_tokens
-        output.zero_()
+        from .ops import qsa as _qsa_ops
+
+        if _qsa_ops.MONO_QSA:
+            # MonoKernel QSA: the sparse kernel writes every live row; only
+            # padding needs zeros
+            if output.shape[0] > num_tokens:
+                output[num_tokens:].zero_()
+        else:
+            output.zero_()
         if num_tokens == 0:
             return output
 

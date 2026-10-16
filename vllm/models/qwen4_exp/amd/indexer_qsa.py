@@ -27,6 +27,7 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
+from . import mono_decode_rdna2
 
 
 def apply_qsa_rope(
@@ -134,6 +135,9 @@ class QSAIndexer(nn.Module):
         # pinning BF16.
         qsa_dtype = vllm_config.model_config.dtype
 
+        # MonoKernel QSA part (--monokernel on gfx10x), else None
+        self._mono_qsa = mono_decode_rdna2.qsa_part(vllm_config)
+
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
         self.index_kv_heads = int(config.indexer_kv_heads)
@@ -201,6 +205,12 @@ class QSAIndexer(nn.Module):
             dim=-1,
         )
         q = q_raw.reshape(-1, self.index_n_heads, self.index_head_dim)
+        if self._mono_qsa is not None:
+            fused = self._mono_qsa.norm_rope(
+                self.q_layernorm, self.rotary_emb, positions, q
+            )
+            if fused is not None:
+                return fused, token_k.reshape(-1, 1, self.index_head_dim)
         q = apply_qsa_rmsnorm(
             self.q_layernorm,
             q.reshape(-1, self.index_head_dim),
@@ -214,14 +224,23 @@ class QSAIndexer(nn.Module):
         first_rope_positions: torch.Tensor,
     ) -> torch.Tensor:
         """Normalize pooled K and apply the first token's exact group position."""
-        keys = compressed_keys.reshape(-1, self.index_head_dim)
-        keys = apply_qsa_rmsnorm(self.k_layernorm, keys).reshape(
-            -1, 1, self.index_head_dim
-        )
         if getattr(self.rotary_emb, "mrope_section", None):
             positions = first_rope_positions.transpose(0, 1)
         else:
             positions = first_rope_positions[:, 0]
+        if self._mono_qsa is not None:
+            fused = self._mono_qsa.norm_rope(
+                self.k_layernorm,
+                self.rotary_emb,
+                positions,
+                compressed_keys.reshape(-1, 1, self.index_head_dim),
+            )
+            if fused is not None:
+                return fused
+        keys = compressed_keys.reshape(-1, self.index_head_dim)
+        keys = apply_qsa_rmsnorm(self.k_layernorm, keys).reshape(
+            -1, 1, self.index_head_dim
+        )
         return apply_qsa_rope(self.rotary_emb, positions, keys)
 
     def _metadata(
@@ -277,6 +296,21 @@ class QSAIndexer(nn.Module):
             rope_position_cache,
         )
         normalized = self.normalize_compressed_keys(pooled, first_positions)
+        if (
+            self._mono_qsa is not None
+            and rope_position_cache is not None
+            and self._mono_qsa.store_rows3(
+                self.compressed_key_cache.kv_cache,
+                compressed_metadata.slot_mapping,
+                normalized,
+                raw_key_cache,
+                raw_metadata.slot_mapping,
+                token_k[:num_tokens],
+                rope_position_cache,
+                position_rows,
+            )
+        ):
+            return
         qsa_store_cache_rows(
             self.compressed_key_cache.kv_cache,
             compressed_metadata.slot_mapping,
@@ -312,7 +346,9 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
-            max_seq_len=metadata.max_seq_len if metadata.num_prefills else None,
+            max_seq_len=metadata.max_seq_len
+            if metadata.num_prefills or self._mono_qsa is not None
+            else None,
         )
 
     def forward(
